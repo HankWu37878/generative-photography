@@ -156,10 +156,10 @@ We thank [AnimateDiff](https://github.com/guoyww/AnimateDiff) and [CameraCtrl](h
 ## BibTeX
 If you feel this project helpful/insightful, please cite our paper:
 ```bibtex
-@article{Yuan_2025_GenPhoto,
+@article{Yuan_2024_GenPhoto,
   title={Generative Photography: Scene-Consistent Camera Control for Realistic Text-to-Image Synthesis},
   author={Yuan, Yu and Wang, Xijun and Sheng, Yichen and Chennuri, Prateek and Zhang, Xingguang and Chan, Stanley},
   journal={arXiv preprint arXiv:2412.02168},
-  year={2025}
+  year={2024}
 }
 ```
