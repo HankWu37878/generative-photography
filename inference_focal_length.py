@@ -1,3 +1,8 @@
+# ============================
+#  inference_focal_length_img.py
+#  (image → varying focal length)
+# ============================
+
 import os
 import torch
 import logging
@@ -6,6 +11,8 @@ import json
 import numpy as np
 import torch.nn.functional as F
 from pathlib import Path
+from PIL import Image
+
 from omegaconf import OmegaConf
 from torch.utils.data import Dataset
 from transformers import CLIPTextModel, CLIPTokenizer
@@ -20,6 +27,10 @@ from genphoto.utils.util import save_videos_grid
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+# ============================================================
+# >>> SAME CAMERA EMBEDDING CODE AS YOUR ORIGINAL <<<
+# ============================================================
 
 def create_focal_length_embedding(focal_length_values, target_height, target_width, base_focal_length=24.0, sensor_height=24.0, sensor_width=36.0):
     device = 'cpu'
@@ -130,6 +141,22 @@ class Camera_Embedding(Dataset):
         return camera_embedding
 
 
+# ============================================================
+# Image preprocessing for VAE
+# ============================================================
+
+def load_img(path, height, width):
+    image = Image.open(path).convert("RGB")
+    image = image.resize((width, height), Image.LANCZOS)
+    image = np.array(image).astype(np.float32) / 255.0
+    image = image[None].transpose(0, 3, 1, 2)  # BCHW
+    return torch.from_numpy(image)
+
+
+# ============================================================
+# Load models (unchanged from original)
+# ============================================================
+
 def load_models(cfg):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -206,17 +233,47 @@ def load_models(cfg):
     return pipeline, device
 
 
-def run_inference(pipeline, tokenizer, text_encoder, base_scene, focal_length_list, output_dir, device, video_length=5, height=256, width=384):
+
+# ============================================================
+# NEW: Inference with image conditioning
+# ============================================================
+
+def run_inference(
+    pipeline, tokenizer, text_encoder,
+    base_scene, focal_length_list,
+    image_path, output_dir,
+    device, video_length=5, height=256, width=384
+):
     os.makedirs(output_dir, exist_ok=True)
 
-    focal_length_list_str = focal_length_list
-    focal_length_values = json.loads(focal_length_list_str)
-    focal_length_values = torch.tensor(focal_length_values).unsqueeze(1)
+    # -------- Load + encode the image through VAE --------
+    logger.info(f"Loading input image: {image_path}")
+    image_tensor = load_img(image_path, height, width).to(device)
 
-    # Ensure camera_embedding is on the correct device
-    camera_embedding = Camera_Embedding(focal_length_values, tokenizer, text_encoder, device).load()
-    camera_embedding = rearrange(camera_embedding.unsqueeze(0), "b f c h w -> b c f h w")
+    with torch.no_grad():
+        posterior = pipeline.vae.encode(image_tensor)
+        image_latents = posterior.latent_dist.sample()
+        image_latents = image_latents * 0.18215  # SD scaling
 
+    logger.info(f"Image latents shape: {image_latents.shape}") 
+    # (1, 4, H/8, W/8)
+
+    # Expand latents across video frames
+    image_latents = image_latents.unsqueeze(2).repeat(1, 1, video_length, 1, 1)
+
+    # -------- Camera embedding (your original logic) --------
+    focal_length_values = torch.tensor(
+        json.loads(focal_length_list)
+    ).unsqueeze(1)
+
+    camera_embedding = Camera_Embedding(
+        focal_length_values, tokenizer, text_encoder, device
+    ).load()
+
+    camera_embedding = rearrange(camera_embedding.unsqueeze(0),
+                                 "b f c h w -> b c f h w")
+
+    # -------- Run the pipeline --------
     with torch.no_grad():
         sample = pipeline(
             prompt=base_scene,
@@ -224,34 +281,44 @@ def run_inference(pipeline, tokenizer, text_encoder, base_scene, focal_length_li
             video_length=video_length,
             height=height,
             width=width,
+            guidance_scale=8.0,
             num_inference_steps=25,
-            guidance_scale=8.0
+            latents=image_latents.to(device)   # <<<<<< Inject the image here
         ).videos[0]
 
-    sample_save_path = os.path.join(output_dir, "sample.gif")
-    save_videos_grid(sample[None, ...], sample_save_path)
-    logger.info(f"Saved generated sample to {sample_save_path}")
+    # -------- Save result --------
+    save_path = os.path.join(output_dir, "sample.gif")
+    save_videos_grid(sample[None, ...], save_path)
+    logger.info(f"Saved generated sample to {save_path}")
 
 
-def main(config_path, base_scene, focal_length_list):
+
+# ============================================================
+# Main
+# ============================================================
+
+def main(config_path, base_scene, focal_length_list, image_path):
     torch.manual_seed(42)
     cfg = OmegaConf.load(config_path)
+
     logger.info("Loading models...")
     pipeline, device = load_models(cfg)
+
     logger.info("Starting inference...")
-
-
-    run_inference(pipeline, pipeline.tokenizer, pipeline.text_encoder, base_scene, focal_length_list, cfg.output_dir, device=device)
+    run_inference(
+        pipeline, pipeline.tokenizer, pipeline.text_encoder,
+        base_scene, focal_length_list,
+        image_path, cfg.output_dir, device=device
+    )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True, help="Path to YAML configuration file")
-    parser.add_argument("--base_scene", type=str, required=True, help="invariant scene caption as JSON string")
-    parser.add_argument("--focal_length_list", type=str, required=True, help="focal_length values as JSON string")
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--base_scene", type=str, required=True)
+    parser.add_argument("--focal_length_list", type=str, required=True)
+    parser.add_argument("--image_path", type=str, required=True)
     args = parser.parse_args()
-    main(args.config, args.base_scene, args.focal_length_list)
 
-    # usage example
-    # python inference_focal_length.py --config configs/inference_genphoto/adv3_256_384_genphoto_relora_focal_length.yaml --base_scene "A cozy living room with a large, comfy sofa and a coffee table." --focal_length_list "[25.0, 35.0, 45.0, 55.0, 65.0]"
+    main(args.config, args.base_scene, args.focal_length_list, args.image_path)
 
