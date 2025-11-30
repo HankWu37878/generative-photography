@@ -70,9 +70,7 @@ class Camera_Embedding(Dataset):
         self.sample_size = sample_size
 
     def load(self):
-        if len(self.focal_length_values) != 5:
-            raise ValueError("Expected 5 focal_length values")
-
+        f = len(self.focal_length_values)
         prompts = [f"<focal length: {fl.item()}>" for fl in self.focal_length_values]
 
         with torch.no_grad():
@@ -93,13 +91,21 @@ class Camera_Embedding(Dataset):
         if pad_length > 0:
             concatenated_differences = F.pad(concatenated_differences, (0, 0, 0, pad_length))
 
-        frame = concatenated_differences.size(0)
-        ccl_embedding = concatenated_differences.reshape(frame, self.sample_size[0], self.sample_size[1])
-        ccl_embedding = ccl_embedding.unsqueeze(1).expand(-1, 3, -1, -1).to(self.device)
-        focal_length_embedding = create_focal_length_embedding(self.focal_length_values, self.sample_size[0], self.sample_size[1]).to(self.device)
+        # reshape differences to [B=1, C, F, H, W]
+        ccl_embedding = concatenated_differences.unsqueeze(0)  # [1, F, seq_len]
+        ccl_embedding = ccl_embedding.unsqueeze(2).unsqueeze(3)  # [1, F, 1, 1, seq_len]
+        ccl_embedding = ccl_embedding.expand(-1, -1, 3, self.sample_size[0], self.sample_size[1])  # [1, F, 3, H, W]
+        ccl_embedding = ccl_embedding.permute(0, 2, 1, 3, 4)  # [B=1, C=3, F, H, W]
 
-        camera_embedding = torch.cat((focal_length_embedding, ccl_embedding), dim=1)
+        # focal length embedding: [F, 3, H, W] -> add batch dim
+        focal_length_embedding = create_focal_length_embedding(self.focal_length_values, self.sample_size[0], self.sample_size[1]).to(self.device)
+        focal_length_embedding = focal_length_embedding.unsqueeze(0).permute(0, 2, 1, 3, 4)  # [1, C=3, F, H, W]
+
+        # concatenate along channel dimension
+        camera_embedding = torch.cat([focal_length_embedding, ccl_embedding], dim=1)  # [1, C=6, F, H, W]
+
         return camera_embedding
+
 
 # ===========================
 # Image loading
@@ -152,22 +158,27 @@ def run_inference(pipeline, tokenizer, text_encoder, base_scene, focal_length_li
                   image_path, output_dir, device, video_length=5, height=256, width=384):
     os.makedirs(output_dir, exist_ok=True)
 
-    # Load image
+    # Load image (3 channels)
     image_tensor = load_img(image_path, height, width).to(device)
-    with torch.no_grad():
-        posterior = pipeline.vae.encode(image_tensor)
-        image_latents = posterior.latent_dist.sample() * 0.18215  # SD scaling
-        # expand latents for video
-        image_latents = image_latents.unsqueeze(2).repeat(1, 1, video_length, 1, 1)
+    
+    # --- DDIM inversion ---
+    logger.info("Performing DDIM inversion...")
+    inverted_latents = pipeline.invert_image_ddim(image=image_tensor)
 
-    # Camera embedding
-    focal_length_values = torch.tensor(json.loads(focal_length_list)).unsqueeze(1).to(device)
+    # Ensure latents have explicit frame dimension [B, C, F, H, W]
+    if inverted_latents.ndim == 4:  # [B, C, H, W]
+        inverted_latents = inverted_latents.unsqueeze(2).repeat(1, 1, video_length, 1, 1)
+    elif inverted_latents.ndim == 5 and inverted_latents.shape[2] != video_length:
+        inverted_latents = inverted_latents.repeat(1, 1, video_length, 1, 1)
+
+    # --- Camera embedding ---
+    focal_length_values = torch.tensor(json.loads(focal_length_list), dtype=torch.float32).to(device)
+
     camera_embedding = Camera_Embedding(focal_length_values, tokenizer, text_encoder, device).load()
-    camera_embedding = rearrange(camera_embedding.unsqueeze(0), "b f c h w -> b c f h w")
 
-    # Run pipeline (DDIM denoising is handled internally)
+    # --- Run pipeline ---
     with torch.no_grad():
-        video = pipeline(
+        output = pipeline(
             prompt=base_scene,
             camera_embedding=camera_embedding,
             video_length=video_length,
@@ -175,12 +186,18 @@ def run_inference(pipeline, tokenizer, text_encoder, base_scene, focal_length_li
             width=width,
             guidance_scale=8.0,
             num_inference_steps=25,
-            latents=image_latents
-        ).videos[0]
+            latents=inverted_latents
+        )
 
+    sample = output.videos[0]  # get first video
+
+    # Save output
     save_path = os.path.join(output_dir, "sample.gif")
-    save_videos_grid(video[None, ...], save_path)
+    save_videos_grid(sample[None, ...], save_path)
     logger.info(f"Saved generated sample to {save_path}")
+
+
+
 
 
 # ===========================
