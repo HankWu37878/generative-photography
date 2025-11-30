@@ -4,7 +4,8 @@ import inspect
 import torch
 
 import numpy as np
-
+import torch
+from torch import nn
 from typing import Callable, List, Optional, Union
 from dataclasses import dataclass
 from diffusers.utils import is_accelerate_available
@@ -454,29 +455,55 @@ class GenPhotoPipeline(AnimationPipeline):
                      EulerDiscreteScheduler,
                      EulerAncestralDiscreteScheduler,
                      DPMSolverMultistepScheduler],
-                 camera_encoder: CameraCameraEncoder):
+                 camera_encoder: nn.Module):
 
         super().__init__(vae, text_encoder, tokenizer, unet, scheduler)
+        self.register_modules(camera_encoder=camera_encoder)
 
-        self.register_modules(
-            camera_encoder=camera_encoder
-        )
+    # --- DDIM inversion ---
+    @torch.no_grad()
+    def invert_image_ddim(
+        self,
+        image: torch.FloatTensor,
+        num_inversion_steps: int = 50,
+        eta: float = 0.0,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+    ) -> torch.FloatTensor:
+        """
+        Convert an image into diffusion latent space using DDIM inversion.
+        Returns latents that can be passed to __call__.
+        """
+        device = image.device
+        # Encode image to VAE latent
+        vae_latent = 1 / 0.18215 * self.vae.encode(image).latent_dist.sample()
+        vae_latent = rearrange(vae_latent, "b c h w -> b c 1 h w")  # add video dimension
 
+        # Setup DDIM scheduler timesteps
+        self.scheduler.set_timesteps(num_inversion_steps, device=device)
+        timesteps = self.scheduler.timesteps
+
+        # Iteratively invert latent
+        latents = vae_latent
+        for t in reversed(timesteps):
+            latents = self.scheduler.step(latents, t, latents, eta=eta, generator=generator).prev_sample
+
+        return latents
+
+    # --- Decode latents to video ---
     def decode_latents(self, latents):
         video_length = latents.shape[2]
         latents = 1 / 0.18215 * latents
         latents = rearrange(latents, "b c f h w -> (b f) c h w")
-        # video = self.vae.decode(latents).sample
         video = []
         for frame_idx in range(latents.shape[0]):
             video.append(self.vae.decode(latents[frame_idx:frame_idx+1]).sample)
         video = torch.cat(video)
         video = rearrange(video, "(b f) c h w -> b c f h w", f=video_length)
         video = (video / 2 + 0.5).clamp(0, 1)
-        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
         video = video.cpu().float().numpy()
         return video
 
+    # --- Prompt encoding ---
     def _encode_prompt(self, prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt):
         batch_size = len(prompt) if isinstance(prompt, list) else 1
 
@@ -493,44 +520,27 @@ class GenPhotoPipeline(AnimationPipeline):
         if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
             removed_text = self.tokenizer.batch_decode(untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1])
             logger.warning(
-                "The following part of your input was truncated because CLIP can only handle sequences up to"
-                f" {self.tokenizer.model_max_length} tokens: {removed_text}"
+                f"The following part of your input was truncated: {removed_text}"
             )
 
-        if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
-            attention_mask = text_inputs.attention_mask.to(device)
-        else:
-            attention_mask = None
+        attention_mask = text_inputs.attention_mask.to(device) if hasattr(self.text_encoder.config, "use_attention_mask") else None
 
         text_embeddings = self.text_encoder(
             text_input_ids.to(device),
             attention_mask=attention_mask,
-        )
-        text_embeddings = text_embeddings[0]
+        )[0]
 
-        # duplicate text embeddings for each generation per prompt, using mps friendly method
         bs_embed, seq_len, _ = text_embeddings.shape
         text_embeddings = text_embeddings.repeat(1, num_videos_per_prompt, 1)
         text_embeddings = text_embeddings.view(bs_embed * num_videos_per_prompt, seq_len, -1)
 
-        # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance:
-            uncond_tokens: List[str]
             if negative_prompt is None:
                 uncond_tokens = [""] * batch_size
-            elif type(prompt) is not type(negative_prompt):
-                raise TypeError(
-                    f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
-                    f" {type(prompt)}."
-                )
             elif isinstance(negative_prompt, str):
                 uncond_tokens = [negative_prompt]
             elif batch_size != len(negative_prompt):
-                raise ValueError(
-                    f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
-                    f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
-                    " the batch size of `prompt`."
-                )
+                raise ValueError("negative_prompt batch size mismatch")
             else:
                 uncond_tokens = negative_prompt
 
@@ -542,30 +552,21 @@ class GenPhotoPipeline(AnimationPipeline):
                 truncation=True,
                 return_tensors="pt",
             )
-
-            if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
-                attention_mask = uncond_input.attention_mask.to(device)
-            else:
-                attention_mask = None
-
+            attention_mask = uncond_input.attention_mask.to(device) if hasattr(self.text_encoder.config, "use_attention_mask") else None
             uncond_embeddings = self.text_encoder(
                 uncond_input.input_ids.to(device),
                 attention_mask=attention_mask,
-            )
-            uncond_embeddings = uncond_embeddings[0]
+            )[0]
 
-            # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
             seq_len = uncond_embeddings.shape[1]
             uncond_embeddings = uncond_embeddings.repeat(1, num_videos_per_prompt, 1)
             uncond_embeddings = uncond_embeddings.view(batch_size * num_videos_per_prompt, seq_len, -1)
 
-            # For classifier free guidance, we need to do two forward passes.
-            # Here we concatenate the unconditional and text embeddings into a single batch
-            # to avoid doing two forward passes
             text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
 
         return text_embeddings
 
+    # --- Main pipeline call ---
     @torch.no_grad()
     def __call__(
         self,

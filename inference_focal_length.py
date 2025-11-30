@@ -146,26 +146,8 @@ def load_models(cfg):
     return pipeline, device
 
 # ===========================
-# DDIM inversion
-# ===========================
-
-def ddim_inversion(pipeline, image_latents, num_steps=50):
-    device = image_latents.device
-    scheduler = pipeline.scheduler
-    scheduler.set_timesteps(num_steps, device=device)
-
-    latents = image_latents.clone()
-
-    with torch.no_grad():
-        for t in reversed(scheduler.timesteps):
-            noise_pred = pipeline.unet(latents, t, encoder_hidden_states=None).sample
-            latents = scheduler.step(noise_pred, t, latents, eta=0.0).prev_sample
-    return latents
-
-# ===========================
 # Inference with image
 # ===========================
-
 def run_inference(pipeline, tokenizer, text_encoder, base_scene, focal_length_list,
                   image_path, output_dir, device, video_length=5, height=256, width=384):
     os.makedirs(output_dir, exist_ok=True)
@@ -175,20 +157,17 @@ def run_inference(pipeline, tokenizer, text_encoder, base_scene, focal_length_li
     with torch.no_grad():
         posterior = pipeline.vae.encode(image_tensor)
         image_latents = posterior.latent_dist.sample() * 0.18215  # SD scaling
-
-    # DDIM inversion
-    logger.info("Performing DDIM inversion...")
-    inverted_latents = ddim_inversion(pipeline, image_latents, num_steps=50)
-    inverted_latents = inverted_latents.unsqueeze(2).repeat(1, 1, video_length, 1, 1)
+        # expand latents for video
+        image_latents = image_latents.unsqueeze(2).repeat(1, 1, video_length, 1, 1)
 
     # Camera embedding
-    focal_length_values = torch.tensor(json.loads(focal_length_list)).unsqueeze(1)
+    focal_length_values = torch.tensor(json.loads(focal_length_list)).unsqueeze(1).to(device)
     camera_embedding = Camera_Embedding(focal_length_values, tokenizer, text_encoder, device).load()
     camera_embedding = rearrange(camera_embedding.unsqueeze(0), "b f c h w -> b c f h w")
 
-    # Run pipeline
+    # Run pipeline (DDIM denoising is handled internally)
     with torch.no_grad():
-        sample = pipeline(
+        video = pipeline(
             prompt=base_scene,
             camera_embedding=camera_embedding,
             video_length=video_length,
@@ -196,27 +175,33 @@ def run_inference(pipeline, tokenizer, text_encoder, base_scene, focal_length_li
             width=width,
             guidance_scale=8.0,
             num_inference_steps=25,
-            latents=inverted_latents
+            latents=image_latents
         ).videos[0]
 
     save_path = os.path.join(output_dir, "sample.gif")
-    save_videos_grid(sample[None, ...], save_path)
+    save_videos_grid(video[None, ...], save_path)
     logger.info(f"Saved generated sample to {save_path}")
+
 
 # ===========================
 # Main
 # ===========================
-
 def main(config_path, base_scene, focal_length_list, image_path):
     torch.manual_seed(42)
     cfg = OmegaConf.load(config_path)
     pipeline, device = load_models(cfg)
 
     run_inference(
-        pipeline, pipeline.tokenizer, pipeline.text_encoder,
-        base_scene, focal_length_list,
-        image_path, cfg.output_dir, device=device
+        pipeline=pipeline,
+        tokenizer=pipeline.tokenizer,
+        text_encoder=pipeline.text_encoder,
+        base_scene=base_scene,
+        focal_length_list=focal_length_list,
+        image_path=image_path,
+        output_dir=cfg.output_dir,
+        device=device
     )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
