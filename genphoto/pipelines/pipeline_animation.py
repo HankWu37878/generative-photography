@@ -4,9 +4,7 @@ import inspect
 import torch
 
 import numpy as np
-import torch
-from torch import nn
-import torch.nn.functional as F
+
 from typing import Callable, List, Optional, Union
 from dataclasses import dataclass
 from diffusers.utils import is_accelerate_available
@@ -26,6 +24,7 @@ from diffusers.schedulers import (
 )
 from diffusers.loaders import LoraLoaderMixin
 from diffusers.utils import deprecate, logging, BaseOutput
+import PIL.Image as Image
 
 from genphoto.models.camera_adaptor import CameraCameraEncoder
 from genphoto.models.unet import UNet3DConditionModel
@@ -449,58 +448,84 @@ class GenPhotoPipeline(AnimationPipeline):
                  text_encoder: CLIPTextModel,
                  tokenizer: CLIPTokenizer,
                  unet: UNet3DConditionModel,
-                 scheduler: Union[
-                     DDIMScheduler,
-                     PNDMScheduler,
-                     LMSDiscreteScheduler,
-                     EulerDiscreteScheduler,
-                     EulerAncestralDiscreteScheduler,
-                     DPMSolverMultistepScheduler],
+                 scheduler: DDIMScheduler,
                  camera_encoder: CameraCameraEncoder):
 
         super().__init__(vae, text_encoder, tokenizer, unet, scheduler)
         self.register_modules(camera_encoder=camera_encoder)
 
-    # --- DDIM inversion ---
     @torch.no_grad()
-    def invert_image_ddim(
-        self,
-        image: torch.FloatTensor,
-        num_inversion_steps: int = 50,
-        eta: float = 0.0,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-    ) -> torch.FloatTensor:
+    def prepare_latents(self, batch_size, num_channels_latents, video_length, height, width, dtype, device, generator=None, latents=None):
         """
-        Convert an image into diffusion latent space using DDIM inversion.
-        Returns latents that can be passed to __call__.
+        Handwritten DDIM inversion directly inside prepare_latents
+        Outputs [1,4,5,32,48] latents
         """
-        device = image.device
-        vae_latent = 1 / 0.18215 * self.vae.encode(image).latent_dist.sample()
-        vae_latent = rearrange(vae_latent, "b c h w -> b c 1 h w")  # add video dimension
+        # --- Step 1: Load image and encode to VAE latent ---
+        img = Image.open("content/dog.jpeg").convert("RGB")
+        img = img.resize((width, height), Image.LANCZOS)
+        img = np.array(img).astype(np.float32) / 255.0
+        img_tensor = torch.from_numpy(img).permute(2,0,1).unsqueeze(0).to(device)  # [1,3,H,W]
 
-        self.scheduler.set_timesteps(num_inversion_steps, device=device)
-        timesteps = self.scheduler.timesteps
+        # Encode image to latent
+        latent = 1 / 0.18215 * self.vae.encode(img_tensor).latent_dist.sample()  # [1,4,H/8,W/8]
 
-        latents = vae_latent
+        # --- Step 2: Initialize DDIM parameters ---
+        num_inference_steps = self.scheduler.config.num_train_timesteps  # use scheduler steps
+        betas = self.scheduler.betas.to(device)  # [T]
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)  # [T]
+        sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+        sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
+        eta = 0.0
+
+        # Prepare timesteps
+        timesteps = torch.linspace(num_inference_steps-1, 0, num_inference_steps, device=device).long()
+
+        # --- Step 3: Expand latent to video frames ---
+        latent = latent.unsqueeze(2).expand(-1, -1, video_length, -1, -1)  # [1,4,5,H/8,W/8]
+
+        # --- Step 4: Perform handwritten DDIM inversion ---
         for t in reversed(timesteps):
-            latents = self.scheduler.step(latents, t, latents, eta=eta, generator=generator).prev_sample
+            # scale input latent
+            latent_model_input = self.scheduler.scale_model_input(latent, t)
+            
+            # predict noise using UNet
+            noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=None).sample  # [1,4,5,H/8,W/8]
+            
+            # compute DDIM inversion step manually
+            alpha_t = alphas_cumprod[t]
+            alpha_prev = alphas_cumprod[t-1] if t > 0 else torch.tensor(1.0, device=device)
+            beta_t = betas[t]
 
-        return latents
+            pred_original = (latent - sqrt_one_minus_alphas_cumprod[t] * noise_pred) / sqrt_alphas_cumprod[t]
+            # DDIM formula for previous latent
+            latent = (
+                torch.sqrt(alpha_prev) * pred_original +
+                torch.sqrt(1 - alpha_prev - eta**2 * beta_t) * noise_pred
+            )
 
+        # --- Step 5: Resize latent to desired output ---
+        latent = latent[:, :, :video_length, :32, :48]  # enforce [1,4,5,32,48]
+        return latent.to(dtype=dtype)
+    
     def decode_latents(self, latents):
         video_length = latents.shape[2]
         latents = 1 / 0.18215 * latents
         latents = rearrange(latents, "b c f h w -> (b f) c h w")
+        # video = self.vae.decode(latents).sample
         video = []
         for frame_idx in range(latents.shape[0]):
             video.append(self.vae.decode(latents[frame_idx:frame_idx+1]).sample)
         video = torch.cat(video)
         video = rearrange(video, "(b f) c h w -> b c f h w", f=video_length)
         video = (video / 2 + 0.5).clamp(0, 1)
-        return video.cpu().float().numpy()
+        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
+        video = video.cpu().float().numpy()
+        return video
 
     def _encode_prompt(self, prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt):
         batch_size = len(prompt) if isinstance(prompt, list) else 1
+
         text_inputs = self.tokenizer(
             prompt,
             padding="max_length",
@@ -510,6 +535,7 @@ class GenPhotoPipeline(AnimationPipeline):
         )
         text_input_ids = text_inputs.input_ids
         untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+
         if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
             removed_text = self.tokenizer.batch_decode(untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1])
             logger.warning(
@@ -517,30 +543,71 @@ class GenPhotoPipeline(AnimationPipeline):
                 f" {self.tokenizer.model_max_length} tokens: {removed_text}"
             )
 
-        attention_mask = text_inputs.attention_mask.to(device) if getattr(self.text_encoder.config, "use_attention_mask", False) else None
-        text_embeddings = self.text_encoder(text_input_ids.to(device), attention_mask=attention_mask)[0]
+        if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
+            attention_mask = text_inputs.attention_mask.to(device)
+        else:
+            attention_mask = None
 
-        # duplicate text embeddings per video
+        text_embeddings = self.text_encoder(
+            text_input_ids.to(device),
+            attention_mask=attention_mask,
+        )
+        text_embeddings = text_embeddings[0]
+
+        # duplicate text embeddings for each generation per prompt, using mps friendly method
         bs_embed, seq_len, _ = text_embeddings.shape
-        text_embeddings = text_embeddings.repeat(1, num_videos_per_prompt, 1).view(bs_embed * num_videos_per_prompt, seq_len, -1)
+        text_embeddings = text_embeddings.repeat(1, num_videos_per_prompt, 1)
+        text_embeddings = text_embeddings.view(bs_embed * num_videos_per_prompt, seq_len, -1)
 
+        # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance:
+            uncond_tokens: List[str]
             if negative_prompt is None:
                 uncond_tokens = [""] * batch_size
+            elif type(prompt) is not type(negative_prompt):
+                raise TypeError(
+                    f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
+                    f" {type(prompt)}."
+                )
             elif isinstance(negative_prompt, str):
                 uncond_tokens = [negative_prompt]
             elif batch_size != len(negative_prompt):
-                raise ValueError("negative_prompt batch size mismatch")
+                raise ValueError(
+                    f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
+                    f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
+                    " the batch size of `prompt`."
+                )
             else:
                 uncond_tokens = negative_prompt
 
             max_length = text_input_ids.shape[-1]
-            uncond_input = self.tokenizer(uncond_tokens, padding="max_length", max_length=max_length, truncation=True, return_tensors="pt")
-            attention_mask = uncond_input.attention_mask.to(device) if getattr(self.text_encoder.config, "use_attention_mask", False) else None
-            uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(device), attention_mask=attention_mask)[0]
+            uncond_input = self.tokenizer(
+                uncond_tokens,
+                padding="max_length",
+                max_length=max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
 
+            if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
+                attention_mask = uncond_input.attention_mask.to(device)
+            else:
+                attention_mask = None
+
+            uncond_embeddings = self.text_encoder(
+                uncond_input.input_ids.to(device),
+                attention_mask=attention_mask,
+            )
+            uncond_embeddings = uncond_embeddings[0]
+
+            # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
             seq_len = uncond_embeddings.shape[1]
-            uncond_embeddings = uncond_embeddings.repeat(1, num_videos_per_prompt, 1).view(batch_size * num_videos_per_prompt, seq_len, -1)
+            uncond_embeddings = uncond_embeddings.repeat(1, num_videos_per_prompt, 1)
+            uncond_embeddings = uncond_embeddings.view(batch_size * num_videos_per_prompt, seq_len, -1)
+
+            # For classifier free guidance, we need to do two forward passes.
+            # Here we concatenate the unconditional and text embeddings into a single batch
+            # to avoid doing two forward passes
             text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
 
         return text_embeddings
@@ -550,7 +617,7 @@ class GenPhotoPipeline(AnimationPipeline):
         self,
         prompt: Union[str, List[str]],
         camera_embedding: torch.FloatTensor,
-        video_length: int,
+        video_length: Optional[int],
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 50,
@@ -560,7 +627,6 @@ class GenPhotoPipeline(AnimationPipeline):
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.FloatTensor] = None,
-        ddim_image: Optional[torch.FloatTensor] = None,
         output_type: Optional[str] = "tensor",
         return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
@@ -569,124 +635,131 @@ class GenPhotoPipeline(AnimationPipeline):
         multidiff_overlaps: int = 12,
         **kwargs,
     ):
-        # Defaults
+        # Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
+
+        # Check inputs. Raise error if not correct
         self.check_inputs(prompt, height, width, callback_steps)
 
-        batch_size = 1 if isinstance(prompt, str) else len(prompt)
+        # Define call parameters
+        # batch_size = 1 if isinstance(prompt, str) else len(prompt)
+        batch_size = 1
         if latents is not None:
             batch_size = latents.shape[0]
+        if isinstance(prompt, list):
+            batch_size = len(prompt)
 
-        device = camera_embedding.device if camera_embedding.ndim == 5 else camera_embedding[0].device
+        device = camera_embedding[0].device if isinstance(camera_embedding, list) else camera_embedding.device
+        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+        # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
 
+        # Encode input prompt
         prompt = prompt if isinstance(prompt, list) else [prompt] * batch_size
         if negative_prompt is not None:
             negative_prompt = negative_prompt if isinstance(negative_prompt, list) else [negative_prompt] * batch_size
-        text_embeddings = self._encode_prompt(prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt)
+        text_embeddings = self._encode_prompt(
+            prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt
+        )           # [2bf, l, c]
 
-        # Timesteps
+        # Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
-        # Latents
+        # Prepare latent variables
         single_model_length = video_length
         video_length = multidiff_total_steps * (video_length - multidiff_overlaps) + multidiff_overlaps
-        num_channels_latents = self.unet.config.in_channels
-        if latents is None:
-            if ddim_image is not None:
-                latents = ddim_image
-            else:
-                latents = self.prepare_latents(
-                    batch_size * num_videos_per_prompt,
-                    num_channels_latents,
-                    video_length,
-                    height,
-                    width,
-                    text_embeddings.dtype,
-                    device,
-                    generator,
-                    None,
-                )
+        num_channels_latents = self.unet.in_channels
+        latents = self.prepare_latents(
+            batch_size * num_videos_per_prompt,
+            num_channels_latents,
+            video_length,
+            height,
+            width,
+            text_embeddings.dtype,
+            device,
+            generator,
+            latents,
+        )                   # b c f h w
         latents_dtype = latents.dtype
 
-        # Extra step kwargs
+        # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
-
-        # Encode camera
         if isinstance(camera_embedding, list):
+            assert all([x.ndim == 5 for x in camera_embedding])
             bs = camera_embedding[0].shape[0]
-            camera_features_list = []
+            camera_embedding_features = []
             for pe in camera_embedding:
-                feat = self.camera_encoder(pe)
-                feat = [rearrange(x, "(b f) c h w -> b c f h w", b=bs) for x in feat]
-                camera_features_list.append(feat)
+                camera_embedding_feature = self.camera_encoder(pe)
+                camera_embedding_feature = [rearrange(x, '(b f) c h w -> b c f h w', b=bs) for x in camera_embedding_feature]
+                camera_embedding_features.append(camera_embedding_feature)
         else:
             bs = camera_embedding.shape[0]
-            camera_features_list = self.camera_encoder(camera_embedding)
-            camera_features_list = [rearrange(x, "(b f) c h w -> b c f h w", b=bs) for x in camera_features_list]
-
-        # Flatten & expand camera features
-        camera_features_injected = []
-        for feat in camera_features_list:
-            expanded = []
-            for f in feat:
-                if f.ndim != 5:
-                    raise ValueError(f"Camera feature should be 5D [B, C, F, H, W], got {f.shape}")
-                # Interpolate to match latents
-                expanded.append(F.interpolate(f, size=latents.shape[2:], mode="trilinear", align_corners=False))
-            camera_features_injected.append(expanded)
-
+            assert camera_embedding.ndim == 5
+            camera_embedding_features = self.camera_encoder(camera_embedding)       # bf, c, h, w
+            camera_embedding_features = [rearrange(x, '(b f) c h w -> b c f h w', b=bs)
+                                       for x in camera_embedding_features]
 
         # Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-        if do_classifier_free_guidance:
-            camera_features_injected = [[torch.cat([f, f], dim=0) for f in feat_list] for feat_list in camera_features_injected]
+        if isinstance(camera_embedding_features[0], list):
+            camera_embedding_features = [[torch.cat([x, x], dim=0) for x in camera_embedding_feature]
+                                       for camera_embedding_feature in camera_embedding_features] \
+                if do_classifier_free_guidance else camera_embedding_features
         else:
-            camera_features_injected = camera_features_injected
-
+            camera_embedding_features = [torch.cat([x, x], dim=0) for x in camera_embedding_features] \
+                if do_classifier_free_guidance else camera_embedding_features  # [2b c f h w]
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                noise_pred_full = torch.zeros_like(latents)
-                mask_full = torch.zeros_like(latents)
+                noise_pred_full = torch.zeros_like(latents).to(latents.device)
+                mask_full = torch.zeros_like(latents).to(latents.device)
                 noise_preds = []
-
-                for step_idx in range(multidiff_total_steps):
-                    start_idx = step_idx * (single_model_length - multidiff_overlaps)
+                for multidiff_step in range(multidiff_total_steps):
+                    start_idx = multidiff_step * (single_model_length - multidiff_overlaps)
                     latent_partial = latents[:, :, start_idx: start_idx + single_model_length].contiguous()
                     mask_full[:, :, start_idx: start_idx + single_model_length] += 1
 
-                    camera_feat_input = [f[:, :, start_idx:start_idx+single_model_length] for f in camera_features_injected[step_idx]]
+                    if isinstance(camera_embedding, list):
+                        camera_embedding_features_input = camera_embedding_features[multidiff_step]
+                    else:
+                        camera_embedding_features_input = [x[:, :, start_idx: start_idx + single_model_length]
+                                                         for x in camera_embedding_features]
 
-                    latent_model_input = torch.cat([latent_partial] * 2) if do_classifier_free_guidance else latent_partial
+                    # expand the latents if we are doing classifier free guidance
+                    latent_model_input = torch.cat([latent_partial] * 2) if do_classifier_free_guidance else latent_partial   # [2b c f h w]
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                    # Inject camera features by addition
-                    for f in camera_feat_input:
-                        latent_model_input = latent_model_input + f
-
-                    noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample.to(dtype=latents_dtype)
+                    # predict the noise residual
+                    noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings,
+                                           camera_embedding_features=camera_embedding_features_input).sample.to(dtype=latents_dtype)
+                    # perform guidance
                     if do_classifier_free_guidance:
                         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
                     noise_preds.append(noise_pred)
+                for pred_idx, noise_pred in enumerate(noise_preds):
+                    start_idx = pred_idx * (single_model_length - multidiff_overlaps)
+                    noise_pred_full[:, :, start_idx: start_idx + single_model_length] += noise_pred / mask_full[:, :, start_idx: start_idx + single_model_length]
 
-                for idx, noise_pred in enumerate(noise_preds):
-                    start_idx = idx * (single_model_length - multidiff_overlaps)
-                    noise_pred_full[:, :, start_idx:start_idx+single_model_length] += noise_pred / mask_full[:, :, start_idx:start_idx+single_model_length]
-
+                # compute the previous noisy sample x_t -> x_t-1  b c f h w
                 latents = self.scheduler.step(noise_pred_full, t, latents, **extra_step_kwargs).prev_sample
 
+                # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
 
+        # Post-processing
         video = self.decode_latents(latents)
+
+        # Convert to tensor
         if output_type == "tensor":
             video = torch.from_numpy(video)
 
         if not return_dict:
             return video
+
         return AnimationPipelineOutput(videos=video)
