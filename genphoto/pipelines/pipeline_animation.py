@@ -836,10 +836,27 @@ class GenPhotoPipeline(AnimationPipeline):
             )
             print(f"Random latents shape: {random_latents.shape}", file=sys.stderr, flush=True)
 
-            frame_from_inversion = inverted_latents[:, :, :3, :, :]
-            frames_from_noise = random_latents[:, :, 3:, :, :]
+            inv_mean = inverted_latents.mean().item()
+            inv_std = inverted_latents.std().item()
+            inv_min = inverted_latents.min().item()
+            inv_max = inverted_latents.max().item()
+            
+            rnd_mean = random_latents.mean().item()
+            rnd_std = random_latents.std().item()
+            rnd_min = random_latents.min().item()
+            rnd_max = random_latents.max().item()
+
+            inverted_latents_fixed = inverted_latents * (rnd_std / inv_std)
+
+
+            # Rescale the inverted latents to match the random noise
+            # If inv is 0.68 and rnd is 1.0, this boosts inv by ~1.47x
+
+            print(f"\n[Distribution Check]", file=sys.stderr)
+            print(f"Inverted | Mean: {inv_mean:.4f} | Std: {inv_std:.4f} | Range: [{inv_min:.4f}, {inv_max:.4f}]", file=sys.stderr)
+            print(f"Random   | Mean: {rnd_mean:.4f} | Std: {rnd_std:.4f} | Range: [{rnd_min:.4f}, {rnd_max:.4f}]", file=sys.stderr)
             # latents = torch.cat([frame_from_inversion, frames_from_noise], dim=2)
-            latents = inverted_latents
+            latents =  inverted_latents_fixed * 0.3 + random_latents * 0.7
             
             print(f"Merged hybrid latents.", file=sys.stderr, flush=True)
         else:
