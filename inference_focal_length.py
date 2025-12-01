@@ -208,7 +208,7 @@ def load_models(cfg):
 
 def run_inference(pipeline, tokenizer, text_encoder, base_scene, focal_length_list, output_dir, device, 
                   video_length=5, height=256, width=384,
-                  input_image_path=None, use_inversion=False):  # ADD THESE
+                  input_image_path=None, use_inversion=False, inversion_focal_length_list="[25, 25, 25, 25, 25]"):  # ADD THESE
     
     import sys
     print(f"\n{'='*60}", file=sys.stderr, flush=True)
@@ -226,12 +226,23 @@ def run_inference(pipeline, tokenizer, text_encoder, base_scene, focal_length_li
     camera_embedding = Camera_Embedding(focal_length_values, tokenizer, text_encoder, device).load()
     camera_embedding = rearrange(camera_embedding.unsqueeze(0), "b f c h w -> b c f h w")
     
+
+    inversion_focal_length_list_str = inversion_focal_length_list
+    inversion_focal_length_values = json.loads(inversion_focal_length_list_str)
+    inversion_focal_length_values = torch.tensor(inversion_focal_length_values).unsqueeze(1)
+
+    inversion_camera_embedding = Camera_Embedding(inversion_focal_length_values, tokenizer, text_encoder, device).load()
+    inversion_camera_embedding = rearrange(inversion_camera_embedding.unsqueeze(0), "b f c h w -> b c f h w")
+    
+
+    
     print(f"Camera embedding shape: {camera_embedding.shape}", file=sys.stderr, flush=True)
 
     with torch.no_grad():
         sample = pipeline(
             prompt=base_scene,
             camera_embedding=camera_embedding,
+            inversion_camera_embedding=inversion_camera_embedding,
             video_length=video_length,
             height=height,
             width=width,

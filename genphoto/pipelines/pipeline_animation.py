@@ -570,7 +570,7 @@ class GenPhotoPipeline(AnimationPipeline):
         print(f"✓ Inversion complete: {x.shape}", file=sys.stderr, flush=True)
         print(f"Final inverted latent stats - min: {x.min().item():.4f}, max: {x.max().item():.4f}, mean: {x.mean().item():.4f}", file=sys.stderr, flush=True)
         print(f"{'='*60}\n", file=sys.stderr, flush=True)
-        
+        x = x * self.scheduler.init_noise_sigma
         return x
     # ==================== END NEW METHOD ====================
 
@@ -676,6 +676,7 @@ class GenPhotoPipeline(AnimationPipeline):
         self,
         prompt: Union[str, List[str]],
         camera_embedding: torch.FloatTensor,
+        inversion_camera_embedding: torch.FloatTensor,
         video_length: Optional[int],
         height: Optional[int] = None,
         width: Optional[int] = None,
@@ -768,51 +769,79 @@ class GenPhotoPipeline(AnimationPipeline):
         print("Camera features ready", file=sys.stderr, flush=True)
         # ==================== END CAMERA ENCODING ====================
 
+        # ==================== ENCODE INVERSION CAMERA FEATURES FIRST ====================
+        print("Encoding inversion camera embeddings...", file=sys.stderr, flush=True)
+        if isinstance(inversion_camera_embedding, list):
+            assert all([x.ndim == 5 for x in inversion_camera_embedding])
+            inversion_bs = inversion_camera_embedding[0].shape[0]
+            inversion_camera_embedding_features = []
+            for pe in inversion_camera_embedding:
+                inversion_camera_embedding_features = self.camera_encoder(pe)
+                inversion_camera_embedding_features = [rearrange(x, '(b f) c h w -> b c f h w', b=bs) for x in inversion_camera_embedding_features]
+                inversion_camera_embedding_features.append(inversion_camera_embedding_features)
+        else:
+            bs = camera_embedding.shape[0]
+            assert camera_embedding.ndim == 5
+            camera_embedding_features = self.camera_encoder(camera_embedding)
+            inversion_camera_embedding_features = [rearrange(x, '(b f) c h w -> b c f h w', b=bs)
+                                       for x in camera_embedding_features]
+
+        # Duplicate for CFG
+        if isinstance(inversion_camera_embedding_features[0], list):
+            inversion_camera_embedding_features_cfg = [[torch.cat([x, x], dim=0) for x in inversion_camera_embedding_feature]
+                                       for inversion_camera_embedding_feature in inversion_camera_embedding_features] \
+                if do_classifier_free_guidance else inversion_camera_embedding_features
+        else:
+            inversion_camera_embedding_features_cfg = [torch.cat([x, x], dim=0) for x in inversion_camera_embedding_features] \
+                if do_classifier_free_guidance else inversion_camera_embedding_features
+        
+        print("Inversion Camera features ready", file=sys.stderr, flush=True)
+        # ==================== END CAMERA ENCODING ====================
+
+
+
+
         # ==================== PREPARE LATENTS (WITH OPTIONAL INVERSION) ====================
         print(f"Preparing latents (inversion={use_inversion})...", file=sys.stderr, flush=True)
 
         if use_inversion and input_image_path:
-            # Use DDIM inversion - start from high noise
+            print(f"preparing hybrid initialization: Frame 0 (Inverted) + Frames 1-4 (Random Noise)", file=sys.stderr, flush=True)
+
+            # 1. Run Inversion (Result: [1, 4, 5, 32, 48])
             inverted_latents = self.invert_latents_from_image(
                 input_image_path,
-                single_model_length,  # Use SINGLE frame length, not expanded
+                video_length, # Assuming this generates the full 5 frames as stated
                 height,
                 width,
                 text_embeddings,
-                camera_embedding_features_cfg,
+                inversion_camera_embedding_features_cfg,
                 device,
                 guidance_scale,
                 num_inversion_steps
             )
-            
             print(f"Inverted latents shape: {inverted_latents.shape}", file=sys.stderr, flush=True)
+
+            # 2. Run Prepare Latents (Result: [1, 4, 5, 32, 48])
+            # We generate fresh random noise for the whole sequence
+            random_latents = self.prepare_latents(
+                batch_size * num_videos_per_prompt,
+                num_channels_latents,
+                video_length,
+                height,
+                width,
+                text_embeddings.dtype,
+                device,
+                generator,
+                latents,
+            )
+            print(f"Random latents shape: {random_latents.shape}", file=sys.stderr, flush=True)
+
+            frame_from_inversion = inverted_latents[:, :, :3, :, :]
+            frames_from_noise = random_latents[:, :, 3:, :, :]
+            # latents = torch.cat([frame_from_inversion, frames_from_noise], dim=2)
+            latents = inverted_latents
             
-            # Now expand to full video_length if needed
-            if video_length != single_model_length:
-                print(f"Expanding inverted latents from {single_model_length} to {video_length} frames...", file=sys.stderr, flush=True)
-                
-                # Strategy: Repeat the inverted latents + add small noise variation
-                repeat_factor = video_length // single_model_length
-                remainder = video_length % single_model_length
-                
-                expanded_latents = []
-                for i in range(repeat_factor):
-                    # Add slight noise variation to each repetition for diversity
-                    noise_scale = 0.05 if i > 0 else 0  # First copy is exact, others have small variation
-                    varied_latent = inverted_latents + torch.randn_like(inverted_latents) * noise_scale
-                    expanded_latents.append(varied_latent)
-                
-                if remainder > 0:
-                    expanded_latents.append(inverted_latents[:, :, :remainder])
-                
-                latents = torch.cat(expanded_latents, dim=2)
-                print(f"Expanded latents shape: {latents.shape}", file=sys.stderr, flush=True)
-            else:
-                latents = inverted_latents
-            
-            # IMPORTANT: Don't multiply by init_noise_sigma - inverted latents are already at correct scale
-            print(f"Using inverted latents (no sigma scaling)", file=sys.stderr, flush=True)
-            
+            print(f"Merged hybrid latents.", file=sys.stderr, flush=True)
         else:
             # Use random noise (original behavior)
             latents = self.prepare_latents(
