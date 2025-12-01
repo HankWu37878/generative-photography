@@ -206,19 +206,27 @@ def load_models(cfg):
     return pipeline, device
 
 
-def run_inference(pipeline, tokenizer, text_encoder, base_scene, focal_length_list, output_dir, device, video_length=5, height=256, width=384):
+def run_inference(pipeline, tokenizer, text_encoder, base_scene, focal_length_list, output_dir, device, 
+                  video_length=5, height=256, width=384,
+                  input_image_path=None, use_inversion=False):  # ADD THESE
+    
+    import sys
+    print(f"\n{'='*60}", file=sys.stderr, flush=True)
+    print(f"RUN_INFERENCE STARTED", file=sys.stderr, flush=True)
+    print(f"use_inversion: {use_inversion}", file=sys.stderr, flush=True)
+    print(f"input_image: {input_image_path}", file=sys.stderr, flush=True)
+    print(f"{'='*60}\n", file=sys.stderr, flush=True)
+    
     os.makedirs(output_dir, exist_ok=True)
 
     focal_length_list_str = focal_length_list
     focal_length_values = json.loads(focal_length_list_str)
     focal_length_values = torch.tensor(focal_length_values).unsqueeze(1)
 
-    # Ensure camera_embedding is on the correct device
     camera_embedding = Camera_Embedding(focal_length_values, tokenizer, text_encoder, device).load()
     camera_embedding = rearrange(camera_embedding.unsqueeze(0), "b f c h w -> b c f h w")
-
-
-    print("Camera embedding shape:", camera_embedding.shape) 
+    
+    print(f"Camera embedding shape: {camera_embedding.shape}", file=sys.stderr, flush=True)
 
     with torch.no_grad():
         sample = pipeline(
@@ -228,32 +236,37 @@ def run_inference(pipeline, tokenizer, text_encoder, base_scene, focal_length_li
             height=height,
             width=width,
             num_inference_steps=25,
-            guidance_scale=8.0
+            guidance_scale=8.0,
+            input_image_path=input_image_path,  # ADD
+            use_inversion=use_inversion,  # ADD
+            num_inversion_steps=50  # ADD
         ).videos[0]
 
     sample_save_path = os.path.join(output_dir, "sample.gif")
     save_videos_grid(sample[None, ...], sample_save_path)
     logger.info(f"Saved generated sample to {sample_save_path}")
+    print(f"✓ Inference complete\n", file=sys.stderr, flush=True)
 
 
-def main(config_path, base_scene, focal_length_list):
+def main(config_path, base_scene, focal_length_list, input_image=None, use_inversion=False):  # ADD THESE
     torch.manual_seed(42)
     cfg = OmegaConf.load(config_path)
     logger.info("Loading models...")
     pipeline, device = load_models(cfg)
     logger.info("Starting inference...")
 
-
-    run_inference(pipeline, pipeline.tokenizer, pipeline.text_encoder, base_scene, focal_length_list, cfg.output_dir, device=device)
+    run_inference(pipeline, pipeline.tokenizer, pipeline.text_encoder, base_scene, focal_length_list, 
+                  cfg.output_dir, device=device,
+                  input_image_path=input_image, use_inversion=use_inversion)  # ADD
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to YAML configuration file")
-    parser.add_argument("--base_scene", type=str, required=True, help="invariant scene caption as JSON string")
+    parser.add_argument("--base_scene", type=str, required=True, help="invariant scene caption")
     parser.add_argument("--focal_length_list", type=str, required=True, help="focal_length values as JSON string")
+    parser.add_argument("--input_image", type=str, default=None, help="Path to input image for inversion")  # ADD
+    parser.add_argument("--use_inversion", action="store_true", help="Use DDIM inversion")  # ADD
     args = parser.parse_args()
-    main(args.config, args.base_scene, args.focal_length_list)
-
-    # usage example
-    # python inference_focal_length.py --config configs/inference_genphoto/adv3_256_384_genphoto_relora_focal_length.yaml --base_scene "A cozy living room with a large, comfy sofa and a coffee table." --focal_length_list "[25.0, 35.0, 45.0, 55.0, 65.0]"
+    
+    main(args.config, args.base_scene, args.focal_length_list, args.input_image, args.use_inversion)  # UPDATE    
