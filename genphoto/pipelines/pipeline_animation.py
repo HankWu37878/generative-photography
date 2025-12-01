@@ -4,7 +4,7 @@ import inspect
 import torch
 
 import numpy as np
-
+import torchvision.transforms as T
 from typing import Callable, List, Optional, Union
 from dataclasses import dataclass
 from diffusers.utils import is_accelerate_available
@@ -454,59 +454,96 @@ class GenPhotoPipeline(AnimationPipeline):
         super().__init__(vae, text_encoder, tokenizer, unet, scheduler)
         self.register_modules(camera_encoder=camera_encoder)
 
+
+
     @torch.no_grad()
-    def prepare_latents(self, batch_size, num_channels_latents, video_length, height, width, dtype, device, generator=None, latents=None):
+    def prepare_latents(
+        self,
+        batch_size,
+        num_channels_latents,
+        video_length,
+        height,
+        width,
+        dtype,
+        text_embeddings,
+        device,
+        generator,
+        latents=None
+    ):
         """
-        Handwritten DDIM inversion directly inside prepare_latents
-        Outputs [1,4,5,32,48] latents
+        Prepare latents for multi-focal-length generation from an uploaded image.
+        This version includes building a standard SD pipeline internally.
         """
-        # --- Step 1: Load image and encode to VAE latent ---
-        img = Image.open("content/dog.jpeg").convert("RGB")
-        img = img.resize((width, height), Image.LANCZOS)
-        img = np.array(img).astype(np.float32) / 255.0
-        img_tensor = torch.from_numpy(img).permute(2,0,1).unsqueeze(0).to(device)  # [1,3,H,W]
+        from PIL import Image
+        import torchvision.transforms as T
+        import torch
+        from diffusers import StableDiffusionPipeline, DDIMScheduler
 
-        # Encode image to latent
-        latent = 1 / 0.18215 * self.vae.encode(img_tensor).latent_dist.sample()  # [1,4,H/8,W/8]
+        # --------------------------------------------------------------
+        # 0. Create standard Stable Diffusion pipeline (4D UNet)
+        # --------------------------------------------------------------
+        sd_pipeline = StableDiffusionPipeline.from_pretrained(
+            "runwayml/stable-diffusion-v1-5",
+            torch_dtype=dtype
+        ).to(device)
 
-        # --- Step 2: Initialize DDIM parameters ---
-        num_inference_steps = self.scheduler.config.num_train_timesteps  # use scheduler steps
-        betas = self.scheduler.betas.to(device)  # [T]
-        alphas = 1.0 - betas
-        alphas_cumprod = torch.cumprod(alphas, dim=0)  # [T]
-        sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
-        sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
-        eta = 0.0
+        # Use DDIM scheduler
+        sd_pipeline.scheduler = DDIMScheduler.from_config(sd_pipeline.scheduler.config)
 
-        # Prepare timesteps
-        timesteps = torch.linspace(num_inference_steps-1, 0, num_inference_steps, device=device).long()
+        # --------------------------------------------------------------
+        # 1. Load and encode uploaded image → latent (x_0)
+        # --------------------------------------------------------------
+        img_path = "/content/dog.jpeg"  # TODO: replace with dynamic input
+        image = Image.open(img_path).convert("RGB")
 
-        # --- Step 3: Expand latent to video frames ---
-        latent = latent.unsqueeze(2).expand(-1, -1, video_length, -1, -1)  # [1,4,5,H/8,W/8]
+        transform = T.Compose([
+            T.Resize((height, width)),
+            T.ToTensor(),
+            T.Normalize([0.5]*3, [0.5]*3),
+        ])
+        img_tensor = transform(image).unsqueeze(0).to(device)  # [1,3,H,W]
 
-        # --- Step 4: Perform handwritten DDIM inversion ---
-        for t in reversed(timesteps):
-            # scale input latent
-            latent_model_input = self.scheduler.scale_model_input(latent, t)
-            
-            # predict noise using UNet
-            noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=None).sample  # [1,4,5,H/8,W/8]
-            
-            # compute DDIM inversion step manually
-            alpha_t = alphas_cumprod[t]
-            alpha_prev = alphas_cumprod[t-1] if t > 0 else torch.tensor(1.0, device=device)
-            beta_t = betas[t]
+        # Encode with VAE
+        vae = sd_pipeline.vae
+        latent = vae.encode(img_tensor).latent_dist.sample()  # [1,4,H/8,W/8]
+        latent = latent / vae.config.scaling_factor  # SD-style scaling
 
-            pred_original = (latent - sqrt_one_minus_alphas_cumprod[t] * noise_pred) / sqrt_alphas_cumprod[t]
-            # DDIM formula for previous latent
-            latent = (
-                torch.sqrt(alpha_prev) * pred_original +
-                torch.sqrt(1 - alpha_prev - eta**2 * beta_t) * noise_pred
-            )
+        # --------------------------------------------------------------
+        # 2. Perform DDIM inversion (deterministic)
+        # --------------------------------------------------------------
+        scheduler = sd_pipeline.scheduler
+        timesteps = scheduler.timesteps.to(device)
+        x = latent.clone()
 
-        # --- Step 5: Resize latent to desired output ---
-        latent = latent[:, :, :video_length, :32, :48]  # enforce [1,4,5,32,48]
-        return latent.to(dtype=dtype)
+        for i, t in enumerate(timesteps):
+            t = t.to(device)
+            with torch.no_grad():
+                # UNet 4D prediction
+                unet_pred = sd_pipeline.unet(x, t, encoder_hidden_states=text_embeddings).sample
+
+            # DDIM update
+            a_t = scheduler.alphas_cumprod[t]
+            a_prev = scheduler.alphas_cumprod[timesteps[min(i+1, len(timesteps)-1)]]
+            sqrt_one_minus_a = torch.sqrt(1 - a_t)
+            x0 = (x - sqrt_one_minus_a * unet_pred) / torch.sqrt(a_t)
+            x = torch.sqrt(a_prev) * x0 + torch.sqrt(1 - a_prev) * unet_pred
+
+        x_T = x  # inverted latent
+
+        # --------------------------------------------------------------
+        # 3. Expand latent to 5D: [B, C, F, H, W]
+        # --------------------------------------------------------------
+        x_T = x_T.unsqueeze(2).repeat(1, 1, video_length, 1, 1)  # [B,4,F,H,W]
+
+        print("Final 5D latent shape:", x_T.shape)
+        return x_T
+
+
+
+
+
+
+
     
     def decode_latents(self, latents):
         video_length = latents.shape[2]
@@ -679,6 +716,7 @@ class GenPhotoPipeline(AnimationPipeline):
             height,
             width,
             text_embeddings.dtype,
+            text_embeddings,
             device,
             generator,
             latents,

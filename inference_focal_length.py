@@ -217,6 +217,9 @@ def run_inference(pipeline, tokenizer, text_encoder, base_scene, focal_length_li
     camera_embedding = Camera_Embedding(focal_length_values, tokenizer, text_encoder, device).load()
     camera_embedding = rearrange(camera_embedding.unsqueeze(0), "b f c h w -> b c f h w")
 
+
+    print("Camera embedding shape:", camera_embedding.shape) 
+
     with torch.no_grad():
         sample = pipeline(
             prompt=base_scene,
