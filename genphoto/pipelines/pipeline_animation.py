@@ -730,6 +730,11 @@ class GenPhotoPipeline(AnimationPipeline):
             prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt
         )
 
+        inversion_text_embeddings = self._encode_prompt(
+            "", device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt
+        )
+
+
         # Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
@@ -813,7 +818,7 @@ class GenPhotoPipeline(AnimationPipeline):
                 video_length, # Assuming this generates the full 5 frames as stated
                 height,
                 width,
-                text_embeddings,
+                inversion_text_embeddings,
                 inversion_camera_embedding_features_cfg,
                 device,
                 guidance_scale,
