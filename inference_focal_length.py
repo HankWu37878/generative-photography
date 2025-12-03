@@ -246,8 +246,8 @@ def run_inference(pipeline, tokenizer, text_encoder, base_scene, focal_length_li
             video_length=video_length,
             height=height,
             width=width,
-            num_inference_steps=25,
-            guidance_scale=8.0,
+            num_inference_steps=50,
+            guidance_scale=6.0,
             input_image_path=input_image_path,  # ADD
             use_inversion=use_inversion,  # ADD
             num_inversion_steps=50  # ADD

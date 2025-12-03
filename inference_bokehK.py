@@ -181,7 +181,7 @@ def load_models(cfg):
     return pipeline, device
 
 
-def run_inference(pipeline, tokenizer, text_encoder, base_scene, bokehK_list, output_dir, device, video_length=5, height=256, width=384):
+def run_inference(pipeline, tokenizer, text_encoder, base_scene, bokehK_list, output_dir, device, video_length=5, height=256, width=384, input_image_path=None, use_inversion=False, inversion_bokehK_list="[2.44, 8.3, 10.1, 17.2, 24.0]"):
     os.makedirs(output_dir, exist_ok=True)
 
     bokehK_list_str = bokehK_list
@@ -192,15 +192,26 @@ def run_inference(pipeline, tokenizer, text_encoder, base_scene, bokehK_list, ou
     camera_embedding = Camera_Embedding(bokehK_values, tokenizer, text_encoder, device).load()
     camera_embedding = rearrange(camera_embedding.unsqueeze(0), "b f c h w -> b c f h w")
 
+    inversion_bokehK_list_str = inversion_bokehK_list
+    inversion_bokehK_values = json.loads(inversion_bokehK_list_str)
+    inversion_bokehK_values = torch.tensor(inversion_bokehK_values).unsqueeze(1)
+
+    inversion_camera_embedding = Camera_Embedding(inversion_bokehK_values, tokenizer, text_encoder, device).load()
+    inversion_camera_embedding = rearrange(inversion_camera_embedding.unsqueeze(0), "b f c h w -> b c f h w")
+
     with torch.no_grad():
         sample = pipeline(
             prompt=base_scene,
+            inversion_camera_embedding=inversion_camera_embedding,
             camera_embedding=camera_embedding,
             video_length=video_length,
             height=height,
             width=width,
-            num_inference_steps=25,
-            guidance_scale=8.0
+            num_inference_steps=50,
+            guidance_scale=1.0,
+            input_image_path=input_image_path,  # ADD
+            use_inversion=use_inversion,  # ADD
+            num_inversion_steps=50,
         ).videos[0]
 
     sample_save_path = os.path.join(output_dir, "sample.gif")
@@ -208,7 +219,7 @@ def run_inference(pipeline, tokenizer, text_encoder, base_scene, bokehK_list, ou
     logger.info(f"Saved generated sample to {sample_save_path}")
 
 
-def main(config_path, base_scene, bokehK_list):
+def main(config_path, base_scene, bokehK_list, input_image=None, use_inversion=False):
     torch.manual_seed(42)
     cfg = OmegaConf.load(config_path)
     logger.info("Loading models...")
@@ -216,7 +227,7 @@ def main(config_path, base_scene, bokehK_list):
     logger.info("Starting inference...")
 
 
-    run_inference(pipeline, pipeline.tokenizer, pipeline.text_encoder, base_scene, bokehK_list, cfg.output_dir, device=device)
+    run_inference(pipeline, pipeline.tokenizer, pipeline.text_encoder, base_scene, bokehK_list, cfg.output_dir, device=device, input_image_path=input_image, use_inversion=use_inversion)
 
 
 if __name__ == "__main__":
@@ -224,8 +235,10 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, required=True, help="Path to YAML configuration file")
     parser.add_argument("--base_scene", type=str, required=True, help="invariant scene caption as JSON string")
     parser.add_argument("--bokehK_list", type=str, required=True, help="Bokeh K values as JSON string")
+    parser.add_argument("--input_image", type=str, default=None, help="Path to input image for inversion")  # ADD
+    parser.add_argument("--use_inversion", action="store_true", help="Use DDIM inversion")  # ADD
     args = parser.parse_args()
-    main(args.config, args.base_scene, args.bokehK_list)
+    main(args.config, args.base_scene, args.bokehK_list, args.input_image, args.use_inversion)
 
     # usage example
     # python inference_bokehK.py --config configs/inference_genphoto/adv3_256_384_genphoto_relora_bokehK.yaml --base_scene "A young boy wearing an orange jacket is standing on a crosswalk, waiting to cross the street." --bokehK_list "[2.44, 8.3, 10.1, 17.2, 24.0]"
