@@ -818,10 +818,10 @@ class GenPhotoPipeline(AnimationPipeline):
                 inversion_camera_features_single = [x[:, :, :1] for x in inversion_camera_embedding_features_cfg]
             
             # 1. Invert SINGLE frame (frame 0)
-            concatenate_threshold = 3
+            concatenate_threshold = 4
             inverted_frame0 = self.invert_latents_from_image(
                 input_image_path,
-                concatenate_threshold,  # Only 1 frame
+                5,  # Only 1 frame
                 height,
                 width,
                 inversion_text_embeddings,
@@ -837,7 +837,7 @@ class GenPhotoPipeline(AnimationPipeline):
             random_frames = self.prepare_latents(
                 batch_size * num_videos_per_prompt,
                 num_channels_latents,
-                video_length - concatenate_threshold,  # Frames 1 to end
+                video_length - 0,  # Frames 1 to end
                 height,
                 width,
                 text_embeddings.dtype,
@@ -848,8 +848,14 @@ class GenPhotoPipeline(AnimationPipeline):
             print(f"Random frames shape (1-{video_length-1}): {random_frames.shape}", file=sys.stderr, flush=True)
             print(f"Random frames stats - min: {random_frames.min().item():.4f}, max: {random_frames.max().item():.4f}, mean: {random_frames.mean().item():.4f}", file=sys.stderr, flush=True)
 
+            weights_A = torch.tensor([1.0, 1.0, 1.0, 0.8, 0.5]).view(1, 1, 5, 1, 1).to(device)
+            weights_B = torch.tensor([0.0, 0.0, 0.0, 0.2, 0.5]).view(1, 1, 5, 1, 1).to(device)
+            latents = inverted_frame0 * weights_A + random_frames * weights_B
+
+
+
             # 3. Concatenate: [inverted frame 0] + [random frames 1-4]
-            latents = torch.cat([inverted_frame0, random_frames], dim=2)
+            # latents = torch.cat([inverted_frame0, random_frames], dim=2)
 
             # latents = inverted_frame0
             
