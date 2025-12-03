@@ -481,32 +481,79 @@ class GenPhotoPipeline(AnimationPipeline):
         import sys
         
         print(f"\n{'='*60}", file=sys.stderr, flush=True)
-        print(f"DDIM Inversion Started", file=sys.stderr, flush=True)
+        print(f"DDIM Inversion Started with Progressive Zoom", file=sys.stderr, flush=True)
         print(f"{'='*60}", file=sys.stderr, flush=True)
         
         # Load and preprocess image
-        print(f"Loading image: {image_path}", file=sys.stderr, flush=True)
-        image = Image.open(image_path).convert("RGB")
+        print(f"Loading original image: {image_path}", file=sys.stderr, flush=True)
+        original_image = Image.open(image_path).convert("RGB")
         
-        transform = T.Compose([
-            T.Resize((height, width)),
+        # --- NEW LOGIC: Progressive Center Crop/Zoom ---
+        
+        # 1. Define the target crop ratios for a zoom-in effect
+        # We'll transition from a wide shot (crop_ratio=1.0) to a tight shot (crop_ratio=0.4)
+        # using a linear interpolation over the video_length frames.
+        # This simulates focal lengths 25mm -> 65mm.
+        
+        # Start ratio (e.g., 25mm) and End ratio (e.g., 65mm)
+        start_ratio = 1.0
+        end_ratio = 0.4 
+        
+        # Create a linear progression of ratios
+        crop_ratios = [
+            start_ratio - (start_ratio - end_ratio) * (i / (video_length - 1))
+            for i in range(video_length)
+        ]
+        
+        print(f"Zoom Ratios (Start: {crop_ratios[0]:.2f}, End: {crop_ratios[-1]:.2f})", file=sys.stderr, flush=True)
+        
+        # Define the VAE preprocessing transform (Resize and Normalize)
+        # Note: We apply the crop *manually* before this transform.
+        vae_transform = T.Compose([
+            T.Resize((height, width)), # Resize the cropped image back to target HxW
             T.ToTensor(),
             T.Normalize([0.5]*3, [0.5]*3),
         ])
-        img_tensor = transform(image).unsqueeze(0).to(device=device, dtype=text_embeddings.dtype)
-        print(f"Image tensor shape: {img_tensor.shape}", file=sys.stderr, flush=True)
         
-        # Encode to latent space
-        with torch.no_grad():
-            latent = self.vae.encode(img_tensor).latent_dist.sample()
-            latent = latent * 0.18215  # VAE scaling factor
+        all_latents = []
         
-        print(f"Encoded latent shape: {latent.shape}", file=sys.stderr, flush=True)
-        print(f"Latent stats - min: {latent.min().item():.4f}, max: {latent.max().item():.4f}, mean: {latent.mean().item():.4f}", file=sys.stderr, flush=True)
+        for i in range(video_length):
+            crop_ratio = crop_ratios[i]
+            orig_w, orig_h = original_image.size
+            
+            # Calculate the crop dimensions
+            new_w = int(orig_w * crop_ratio)
+            new_h = int(orig_h * crop_ratio)
+            
+            # Calculate the top-left corner for a center crop
+            left = (orig_w - new_w) // 2
+            top = (orig_h - new_h) // 2
+            right = left + new_w
+            bottom = top + new_h
+            
+            # Perform the center crop
+            zoomed_image = original_image.crop((left, top, right, bottom))
+            
+            # Apply VAE preprocessing (Resize back to HxW and Normalize)
+            img_tensor = vae_transform(zoomed_image).unsqueeze(0).to(device=device, dtype=text_embeddings.dtype)
+            
+            # Encode to latent space
+            with torch.no_grad():
+                latent = self.vae.encode(img_tensor).latent_dist.sample()
+                latent = latent * 0.18215  # VAE scaling factor
+                
+            all_latents.append(latent)
+            
+            if i == 0 or i == video_length // 2 or i == video_length - 1:
+                print(f"  Frame {i+1}/{video_length} | Crop Ratio: {crop_ratio:.2f} | Latent shape: {latent.shape}", file=sys.stderr, flush=True)
+
+        # Combine all latents into the final 5D tensor (B, C, F, H, W)
+        latent_5d = torch.stack(all_latents, dim=2)
         
-        # Expand to video (repeat same frame)
-        latent_5d = latent.unsqueeze(2).repeat(1, 1, video_length, 1, 1)
-        print(f"Expanded to 5D: {latent_5d.shape}", file=sys.stderr, flush=True)
+        print(f"Combined 5D latent shape: {latent_5d.shape}", file=sys.stderr, flush=True)
+        print(f"Latent stats - min: {latent_5d.min().item():.4f}, max: {latent_5d.max().item():.4f}, mean: {latent_5d.mean().item():.4f}", file=sys.stderr, flush=True)
+        
+        # --- END NEW LOGIC ---
         
         # DDIM inversion - go from x_0 to x_T
         self.scheduler.set_timesteps(num_inversion_steps, device=device)
@@ -551,7 +598,7 @@ class GenPhotoPipeline(AnimationPipeline):
             if i + 1 < len(timesteps):
                 next_t_val = timesteps[i + 1].item()
             else:
-                next_t_val = self.scheduler.timesteps[0].item()  # Should be 999 or max timestep
+                next_t_val = self.scheduler.timesteps[0].item()
             
             alpha_t_next = self.scheduler.alphas_cumprod[next_t_val]
             
@@ -848,16 +895,16 @@ class GenPhotoPipeline(AnimationPipeline):
             print(f"Random frames shape (1-{video_length-1}): {random_frames.shape}", file=sys.stderr, flush=True)
             print(f"Random frames stats - min: {random_frames.min().item():.4f}, max: {random_frames.max().item():.4f}, mean: {random_frames.mean().item():.4f}", file=sys.stderr, flush=True)
 
-            weights_A = torch.tensor([1.0, 1.0, 1.0, 0.8, 0.5]).view(1, 1, 5, 1, 1).to(device)
-            weights_B = torch.tensor([0.0, 0.0, 0.0, 0.2, 0.5]).view(1, 1, 5, 1, 1).to(device)
-            latents = inverted_frame0 * weights_A + random_frames * weights_B
+            # weights_A = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0]).view(1, 1, 5, 1, 1).to(device)
+            # weights_B = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0]).view(1, 1, 5, 1, 1).to(device)
+            # latents = inverted_frame0 * weights_A + random_frames * weights_B
 
 
 
             # 3. Concatenate: [inverted frame 0] + [random frames 1-4]
             # latents = torch.cat([inverted_frame0, random_frames], dim=2)
 
-            # latents = inverted_frame0
+            latents = inverted_frame0
             
             print(f"✓ Hybrid latents created: {latents.shape}", file=sys.stderr, flush=True)
             print(f"  - Frame 0: Inverted from input image", file=sys.stderr, flush=True)
