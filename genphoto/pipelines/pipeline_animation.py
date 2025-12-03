@@ -560,17 +560,15 @@ class GenPhotoPipeline(AnimationPipeline):
             predicted_x0 = predicted_x0.detach()
             
             # Direction to next (noisier) latent
-            direction = (1 - alpha_t_next).sqrt() * noise_pred
-            x = alpha_t_next.sqrt() * predicted_x0 + direction
-            
-            del predicted_x0, noise_pred, direction
+            x =  alpha_t_next.sqrt() * predicted_x0 + (1 - alpha_t_next).sqrt() * noise_pred
+            del predicted_x0, noise_pred
             if i % 10 == 0:
                 torch.cuda.empty_cache()
         
         print(f"✓ Inversion complete: {x.shape}", file=sys.stderr, flush=True)
         print(f"Final inverted latent stats - min: {x.min().item():.4f}, max: {x.max().item():.4f}, mean: {x.mean().item():.4f}", file=sys.stderr, flush=True)
         print(f"{'='*60}\n", file=sys.stderr, flush=True)
-        x = x * self.scheduler.init_noise_sigma
+        # x = x * self.scheduler.init_noise_sigma
         return x
     # ==================== END NEW METHOD ====================
 
@@ -696,7 +694,7 @@ class GenPhotoPipeline(AnimationPipeline):
         # ==================== ADD THESE PARAMETERS ====================
         input_image_path: Optional[str] = None,
         use_inversion: bool = False,
-        num_inversion_steps: int = 50,
+        num_inversion_steps: int = 100,
         # ==================== END NEW PARAMETERS ====================
         **kwargs,
     ):
@@ -810,60 +808,54 @@ class GenPhotoPipeline(AnimationPipeline):
         print(f"Preparing latents (inversion={use_inversion})...", file=sys.stderr, flush=True)
 
         if use_inversion and input_image_path:
-            print(f"preparing hybrid initialization: Frame 0 (Inverted) + Frames 1-4 (Random Noise)", file=sys.stderr, flush=True)
+            print(f"Using SOLUTION 1: Frame 0 (Inverted) + Frames 1-{video_length-1} (Random)", file=sys.stderr, flush=True)
 
-            # 1. Run Inversion (Result: [1, 4, 5, 32, 48])
-            inverted_latents = self.invert_latents_from_image(
+            # Extract first frame camera features for inversion
+            if isinstance(inversion_camera_embedding_features_cfg[0], list):
+                inversion_camera_features_single = [[x[:, :, :1] for x in feature_list] 
+                                                   for feature_list in inversion_camera_embedding_features_cfg]
+            else:
+                inversion_camera_features_single = [x[:, :, :1] for x in inversion_camera_embedding_features_cfg]
+            
+            # 1. Invert SINGLE frame (frame 0)
+            concatenate_threshold = 3
+            inverted_frame0 = self.invert_latents_from_image(
                 input_image_path,
-                video_length, # Assuming this generates the full 5 frames as stated
+                concatenate_threshold,  # Only 1 frame
                 height,
                 width,
                 inversion_text_embeddings,
-                inversion_camera_embedding_features_cfg,
+                inversion_camera_features_single,  # Only first frame
                 device,
-                guidance_scale,
+                1.5,
                 num_inversion_steps
             )
-            print(f"Inverted latents shape: {inverted_latents.shape}", file=sys.stderr, flush=True)
+            print(f"Inverted frame 0 shape: {inverted_frame0.shape}", file=sys.stderr, flush=True)
+            print(f"Inverted frame 0 stats - min: {inverted_frame0.min().item():.4f}, max: {inverted_frame0.max().item():.4f}, mean: {inverted_frame0.mean().item():.4f}", file=sys.stderr, flush=True)
 
-            # 2. Run Prepare Latents (Result: [1, 4, 5, 32, 48])
-            # We generate fresh random noise for the whole sequence
-            random_latents = self.prepare_latents(
+            # 2. Generate random noise for remaining frames (1 to video_length-1)
+            random_frames = self.prepare_latents(
                 batch_size * num_videos_per_prompt,
                 num_channels_latents,
-                video_length,
+                video_length - concatenate_threshold,  # Frames 1 to end
                 height,
                 width,
                 text_embeddings.dtype,
                 device,
                 generator,
-                latents,
+                None,
             )
-            print(f"Random latents shape: {random_latents.shape}", file=sys.stderr, flush=True)
+            print(f"Random frames shape (1-{video_length-1}): {random_frames.shape}", file=sys.stderr, flush=True)
+            print(f"Random frames stats - min: {random_frames.min().item():.4f}, max: {random_frames.max().item():.4f}, mean: {random_frames.mean().item():.4f}", file=sys.stderr, flush=True)
 
-            inv_mean = inverted_latents.mean().item()
-            inv_std = inverted_latents.std().item()
-            inv_min = inverted_latents.min().item()
-            inv_max = inverted_latents.max().item()
+            # 3. Concatenate: [inverted frame 0] + [random frames 1-4]
+            latents = torch.cat([inverted_frame0, random_frames], dim=2)
+
+            # latents = inverted_frame0
             
-            rnd_mean = random_latents.mean().item()
-            rnd_std = random_latents.std().item()
-            rnd_min = random_latents.min().item()
-            rnd_max = random_latents.max().item()
-
-            inverted_latents_fixed = inverted_latents * (rnd_std / inv_std)
-
-
-            # Rescale the inverted latents to match the random noise
-            # If inv is 0.68 and rnd is 1.0, this boosts inv by ~1.47x
-
-            print(f"\n[Distribution Check]", file=sys.stderr)
-            print(f"Inverted | Mean: {inv_mean:.4f} | Std: {inv_std:.4f} | Range: [{inv_min:.4f}, {inv_max:.4f}]", file=sys.stderr)
-            print(f"Random   | Mean: {rnd_mean:.4f} | Std: {rnd_std:.4f} | Range: [{rnd_min:.4f}, {rnd_max:.4f}]", file=sys.stderr)
-            # latents = torch.cat([frame_from_inversion, frames_from_noise], dim=2)
-            latents =  inverted_latents_fixed * 0.3 + random_latents * 0.7
-            
-            print(f"Merged hybrid latents.", file=sys.stderr, flush=True)
+            print(f"✓ Hybrid latents created: {latents.shape}", file=sys.stderr, flush=True)
+            print(f"  - Frame 0: Inverted from input image", file=sys.stderr, flush=True)
+            print(f"  - Frames 1-{video_length-1}: Random noise", file=sys.stderr, flush=True)
         else:
             # Use random noise (original behavior)
             latents = self.prepare_latents(
@@ -879,8 +871,8 @@ class GenPhotoPipeline(AnimationPipeline):
             )
             print(f"Using random noise initialization", file=sys.stderr, flush=True)
 
-        print(f"Final latents ready: {latents.shape}", file=sys.stderr, flush=True)
-        print(f"Latents stats - min: {latents.min().item():.4f}, max: {latents.max().item():.4f}, mean: {latents.mean().item():.4f}", file=sys.stderr, flush=True)
+        print(f"Final latents shape: {latents.shape}", file=sys.stderr, flush=True)
+        print(f"Final latents stats - min: {latents.min().item():.4f}, max: {latents.max().item():.4f}, mean: {latents.mean().item():.4f}", file=sys.stderr, flush=True)
         # ==================== END LATENTS PREPARATION ====================
         
         latents_dtype = latents.dtype
