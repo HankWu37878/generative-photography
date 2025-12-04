@@ -611,6 +611,9 @@ class GenPhotoPipeline(AnimationPipeline):
             del predicted_x0, noise_pred
             if i % 10 == 0:
                 torch.cuda.empty_cache()
+
+            if i >= 35:
+              return x
         
         print(f"✓ Inversion complete: {x.shape}", file=sys.stderr, flush=True)
         print(f"Final inverted latent stats - min: {x.min().item():.4f}, max: {x.max().item():.4f}, mean: {x.mean().item():.4f}", file=sys.stderr, flush=True)
@@ -937,6 +940,10 @@ class GenPhotoPipeline(AnimationPipeline):
         
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+
+                if i <= 15:
+                  continue
+                
                 noise_pred_full = torch.zeros_like(latents).to(latents.device)
                 mask_full = torch.zeros_like(latents).to(latents.device)
                 noise_preds = []
