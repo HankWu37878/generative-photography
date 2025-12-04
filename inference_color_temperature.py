@@ -208,7 +208,18 @@ def load_models(cfg):
     return pipeline, device
 
 
-def run_inference(pipeline, tokenizer, text_encoder, base_scene, color_temperature_list, output_dir, device, video_length=5, height=256, width=384):
+def run_inference(pipeline, tokenizer, text_encoder, base_scene, color_temperature_list, output_dir, device, 
+                  video_length=5, height=256, width=384,
+                  input_image_path=None, use_inversion=False, 
+                  inversion_color_temperature_list="[0.3, 0.4, 0.5, 0.6, 0.7]"):
+    
+    import sys
+    print(f"\n{'='*60}", file=sys.stderr, flush=True)
+    print(f"RUN_INFERENCE STARTED", file=sys.stderr, flush=True)
+    print(f"use_inversion: {use_inversion}", file=sys.stderr, flush=True)
+    print(f"input_image: {input_image_path}", file=sys.stderr, flush=True)
+    print(f"{'='*60}\n", file=sys.stderr, flush=True)
+    
     os.makedirs(output_dir, exist_ok=True)
 
     color_temperature_list_str = color_temperature_list
@@ -219,31 +230,48 @@ def run_inference(pipeline, tokenizer, text_encoder, base_scene, color_temperatu
     camera_embedding = Camera_Embedding(color_temperature_values, tokenizer, text_encoder, device).load()
     camera_embedding = rearrange(camera_embedding.unsqueeze(0), "b f c h w -> b c f h w")
 
+    # Create inversion camera embedding
+    inversion_color_temperature_list_str = inversion_color_temperature_list
+    inversion_color_temperature_values = json.loads(inversion_color_temperature_list_str)
+    inversion_color_temperature_values = torch.tensor(inversion_color_temperature_values).unsqueeze(1)
+
+    inversion_camera_embedding = Camera_Embedding(inversion_color_temperature_values, tokenizer, text_encoder, device).load()
+    inversion_camera_embedding = rearrange(inversion_camera_embedding.unsqueeze(0), "b f c h w -> b c f h w")
+
+    print(f"Camera embedding shape: {camera_embedding.shape}", file=sys.stderr, flush=True)
+    print(f"Inversion camera embedding shape: {inversion_camera_embedding.shape}", file=sys.stderr, flush=True)
+
     with torch.no_grad():
         sample = pipeline(
             prompt=base_scene,
             camera_embedding=camera_embedding,
+            inversion_camera_embedding=inversion_camera_embedding,
             video_length=video_length,
             height=height,
             width=width,
-            num_inference_steps=25,
-            guidance_scale=8.0
+            num_inference_steps=50,
+            guidance_scale=5,
+            input_image_path=input_image_path,
+            use_inversion=use_inversion,
+            num_inversion_steps=50,
         ).videos[0]
 
     sample_save_path = os.path.join(output_dir, "sample.gif")
     save_videos_grid(sample[None, ...], sample_save_path)
     logger.info(f"Saved generated sample to {sample_save_path}")
+    print(f"✓ Inference complete\n", file=sys.stderr, flush=True)
 
 
-def main(config_path, base_scene, color_temperature_list):
+def main(config_path, base_scene, color_temperature_list, input_image=None, use_inversion=False):
     torch.manual_seed(42)
     cfg = OmegaConf.load(config_path)
     logger.info("Loading models...")
     pipeline, device = load_models(cfg)
     logger.info("Starting inference...")
 
-
-    run_inference(pipeline, pipeline.tokenizer, pipeline.text_encoder, base_scene, color_temperature_list, cfg.output_dir, device=device)
+    run_inference(pipeline, pipeline.tokenizer, pipeline.text_encoder, base_scene, color_temperature_list, 
+                  cfg.output_dir, device=device,
+                  input_image_path=input_image, use_inversion=use_inversion)
 
 
 if __name__ == "__main__":
@@ -251,10 +279,19 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, required=True, help="Path to YAML configuration file")
     parser.add_argument("--base_scene", type=str, required=True, help="invariant scene caption as JSON string")
     parser.add_argument("--color_temperature_list", type=str, required=True, help="color_temperature values as JSON string")
+    parser.add_argument("--input_image", type=str, default=None, help="Path to input image for inversion")
+    parser.add_argument("--use_inversion", action="store_true", help="Use DDIM inversion")
     args = parser.parse_args()
-    main(args.config, args.base_scene, args.color_temperature_list)
+    
+    main(args.config, args.base_scene, args.color_temperature_list, args.input_image, args.use_inversion, args.use_null_text_inversion)
 
-    # usage example 
+    # usage examples:
+    # 
+    # Basic generation (no inversion):
     # python inference_color_temperature.py --config configs/inference_genphoto/adv3_256_384_genphoto_relora_color_temperature.yaml --base_scene "A beautiful blue sky with a mountain range in the background." --color_temperature_list "[2455.0, 4155.0, 5555.0, 6555.0, 5855.0]"
-
-
+    # 
+    # With DDIM inversion:
+    # python inference_color_temperature.py --config configs/inference_genphoto/adv3_256_384_genphoto_relora_color_temperature.yaml --base_scene "A beautiful blue sky with a mountain range in the background." --color_temperature_list "[2455.0, 4155.0, 5555.0, 6555.0, 5855.0]" --input_image /path/to/image.jpg --use_inversion
+    # 
+    # With null text inversion (best quality):
+    # python inference_color_temperature.py --config configs/inference_genphoto/adv3_256_384_genphoto_relora_color_temperature.yaml --base_scene "A beautiful blue sky with a mountain range in the background." --color_temperature_list "[2455.0, 4155.0, 5555.0, 6555.0, 5855.0]" --input_image /path/to/image.jpg --use_null_text_inversion

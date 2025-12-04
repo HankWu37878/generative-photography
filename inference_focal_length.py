@@ -208,7 +208,7 @@ def load_models(cfg):
 
 def run_inference(pipeline, tokenizer, text_encoder, base_scene, focal_length_list, output_dir, device, 
                   video_length=5, height=256, width=384,
-                  input_image_path=None, use_inversion=False, inversion_focal_length_list="[25, 25, 25, 25, 25]"):  # ADD THESE
+                  input_image_path=None, use_inversion=False, inversion_focal_length_list="[25.0, 35.0, 45.0, 55.0, 65.0]"):  # ADD THESE
     
     import sys
     print(f"\n{'='*60}", file=sys.stderr, flush=True)
@@ -247,7 +247,7 @@ def run_inference(pipeline, tokenizer, text_encoder, base_scene, focal_length_li
             height=height,
             width=width,
             num_inference_steps=50,
-            guidance_scale=6.0,
+            guidance_scale=5,
             input_image_path=input_image_path,  # ADD
             use_inversion=use_inversion,  # ADD
             num_inversion_steps=50  # ADD
