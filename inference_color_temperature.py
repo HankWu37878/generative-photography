@@ -283,7 +283,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_inversion", action="store_true", help="Use DDIM inversion")
     args = parser.parse_args()
     
-    main(args.config, args.base_scene, args.color_temperature_list, args.input_image, args.use_inversion, args.use_null_text_inversion)
+    main(args.config, args.base_scene, args.color_temperature_list, args.input_image, args.use_inversion)
 
     # usage examples:
     # 

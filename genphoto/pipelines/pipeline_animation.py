@@ -458,7 +458,174 @@ class GenPhotoPipeline(AnimationPipeline):
         super().__init__(vae, text_encoder, tokenizer, unet, scheduler)
         self.register_modules(camera_encoder=camera_encoder)
 
-    # ==================== ADD THIS NEW METHOD ====================
+    # ==================== NULL TEXT INVERSION METHOD ====================
+    def null_text_inversion(
+        self,
+        image_path: str,
+        video_length: int,
+        height: int,
+        width: int,
+        prompt: str,
+        camera_embedding_features: List[torch.FloatTensor],
+        device: str = "cuda",
+        guidance_scale: float = 7.5,
+        num_inversion_steps: int = 50,
+        num_inner_steps: int = 10,
+        learning_rate: float = 1e-3,
+    ):
+        """
+        Perform null text inversion: optimize unconditional embeddings during DDIM inversion.
+        Returns: (inverted_latents, optimized_uncond_embeddings_list)
+        """
+        from PIL import Image
+        import torchvision.transforms as T
+        import sys
+        
+        print(f"\n{'='*60}", file=sys.stderr, flush=True)
+        print(f"NULL TEXT INVERSION Started", file=sys.stderr, flush=True)
+        print(f"{'='*60}", file=sys.stderr, flush=True)
+        
+        # Load and encode image to latent
+        print(f"Loading image: {image_path}", file=sys.stderr, flush=True)
+        image = Image.open(image_path).convert("RGB")
+        
+        transform = T.Compose([
+            T.Resize((height, width)),
+            T.ToTensor(),
+            T.Normalize([0.5]*3, [0.5]*3),
+        ])
+        img_tensor = transform(image).unsqueeze(0).to(device=device)
+        
+        with torch.no_grad():
+            latent = self.vae.encode(img_tensor).latent_dist.sample()
+            latent = latent * 0.18215
+            latent = latent.detach()  # Ensure no gradients
+        
+        # Expand to video (repeat same frame)
+        latent_5d = latent.unsqueeze(2).repeat(1, 1, video_length, 1, 1)
+        print(f"Encoded latent shape: {latent_5d.shape}", file=sys.stderr, flush=True)
+        
+        # Get conditional (prompt) embeddings - these stay fixed
+        with torch.no_grad():
+            text_embeddings_cond = self._encode_prompt(
+                [prompt], device, 1, False, None
+            )
+            text_embeddings_cond = text_embeddings_cond.detach()
+        print(f"Conditional embedding shape: {text_embeddings_cond.shape}", file=sys.stderr, flush=True)
+        
+        # Initialize unconditional embeddings - these will be optimized
+        with torch.no_grad():
+            uncond_embeddings = self._encode_prompt(
+                [""], device, 1, False, None
+            )
+            uncond_embeddings = uncond_embeddings.detach()
+        print(f"Initial unconditional embedding shape: {uncond_embeddings.shape}", file=sys.stderr, flush=True)
+        
+        # Setup for inversion
+        self.scheduler.set_timesteps(num_inversion_steps, device=device)
+        timesteps = list(reversed(self.scheduler.timesteps))
+        
+        x = latent_5d.clone()
+        optimized_uncond_list = []  # Store optimized uncond embeddings per timestep
+        
+        print(f"Starting inversion with optimization...", file=sys.stderr, flush=True)
+        
+        for i, t in enumerate(timesteps):
+            print(f"\n--- Timestep {i}/{len(timesteps)}, t={t.item()} ---", file=sys.stderr, flush=True)
+            
+            # ============ INNER OPTIMIZATION LOOP ============
+            # Optimize unconditional embedding to minimize reconstruction error
+            uncond_embeddings_opt = uncond_embeddings.clone().detach()
+            uncond_embeddings_opt.requires_grad = True
+            
+            optimizer = torch.optim.Adam([uncond_embeddings_opt], lr=learning_rate)
+            
+            x_prev = x.detach().clone()
+            
+            for inner_step in range(num_inner_steps):
+                optimizer.zero_grad()
+                
+                # Prepare CFG input
+                latent_model_input = torch.cat([x_prev] * 2)
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                
+                # Combined embeddings for CFG
+                text_embeddings_cfg = torch.cat([uncond_embeddings_opt, text_embeddings_cond])
+                
+                # Predict noise with current unconditional embedding - ENABLE GRADIENTS
+                noise_pred = self.unet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=text_embeddings_cfg,
+                    camera_embedding_features=camera_embedding_features
+                ).sample
+                
+                # Apply CFG
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred_cfg = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                
+                # Compute predicted x0
+                current_t_val = t.item()
+                alpha_t = self.scheduler.alphas_cumprod[current_t_val]
+                predicted_x0 = (x_prev - (1 - alpha_t).sqrt() * noise_pred_cfg) / alpha_t.sqrt()
+                
+                # Loss: reconstruction error between predicted x0 and actual latent
+                loss = torch.nn.functional.mse_loss(predicted_x0, latent_5d)
+                
+                loss.backward()
+                optimizer.step()
+                
+                if inner_step % 5 == 0 or inner_step == num_inner_steps - 1:
+                    print(f"  Inner step {inner_step}/{num_inner_steps}, Loss: {loss.item():.6f}", 
+                          file=sys.stderr, flush=True)
+            
+            # Store optimized unconditional embedding for this timestep
+            optimized_uncond_list.append(uncond_embeddings_opt.detach().clone())
+            print(f"✓ Optimized uncond embedding for timestep {i}", file=sys.stderr, flush=True)
+            
+            # ============ PERFORM INVERSION STEP WITH OPTIMIZED EMBEDDING ============
+            with torch.no_grad():
+                latent_model_input = torch.cat([x] * 2)
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                
+                text_embeddings_cfg = torch.cat([uncond_embeddings_opt, text_embeddings_cond])
+                
+                noise_pred = self.unet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=text_embeddings_cfg,
+                    camera_embedding_features=camera_embedding_features
+                ).sample
+                
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred_cfg = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                
+                # DDIM inversion step
+                alpha_t = self.scheduler.alphas_cumprod[current_t_val]
+                
+                if i + 1 < len(timesteps):
+                    next_t_val = timesteps[i + 1].item()
+                else:
+                    next_t_val = self.scheduler.timesteps[0].item()
+                
+                alpha_t_next = self.scheduler.alphas_cumprod[next_t_val]
+                
+                predicted_x0 = (x - (1 - alpha_t).sqrt() * noise_pred_cfg) / alpha_t.sqrt()
+                x = alpha_t_next.sqrt() * predicted_x0 + (1 - alpha_t_next).sqrt() * noise_pred_cfg
+            
+            print(f"Latent stats - min: {x.min().item():.4f}, max: {x.max().item():.4f}, mean: {x.mean().item():.4f}", 
+                  file=sys.stderr, flush=True)
+        
+        print(f"\n{'='*60}", file=sys.stderr, flush=True)
+        print(f"✓ Null text inversion complete", file=sys.stderr, flush=True)
+        print(f"Inverted latent shape: {x.shape}", file=sys.stderr, flush=True)
+        print(f"Optimized {len(optimized_uncond_list)} unconditional embeddings", file=sys.stderr, flush=True)
+        print(f"{'='*60}\n", file=sys.stderr, flush=True)
+        
+        return x, optimized_uncond_list
+    # ==================== END NULL TEXT INVERSION ====================
+
+    # Keep original DDIM inversion as fallback
     @torch.no_grad()
     def invert_latents_from_image(
         self,
@@ -473,7 +640,7 @@ class GenPhotoPipeline(AnimationPipeline):
         num_inversion_steps: int = 50,
     ):
         """
-        Perform DDIM inversion from an input image.
+        Perform standard DDIM inversion from an input image.
         Returns inverted latents at maximum noise level.
         """
         from PIL import Image
@@ -499,7 +666,7 @@ class GenPhotoPipeline(AnimationPipeline):
         # Encode to latent space
         with torch.no_grad():
             latent = self.vae.encode(img_tensor).latent_dist.sample()
-            latent = latent * 0.18215  # VAE scaling factor
+            latent = latent * 0.18215
         
         print(f"Encoded latent shape: {latent.shape}", file=sys.stderr, flush=True)
         print(f"Latent stats - min: {latent.min().item():.4f}, max: {latent.max().item():.4f}, mean: {latent.mean().item():.4f}", file=sys.stderr, flush=True)
@@ -510,7 +677,7 @@ class GenPhotoPipeline(AnimationPipeline):
         
         # DDIM inversion - go from x_0 to x_T
         self.scheduler.set_timesteps(num_inversion_steps, device=device)
-        timesteps = list(reversed(self.scheduler.timesteps))  # Reverse for inversion
+        timesteps = list(reversed(self.scheduler.timesteps))
         print(f"Inversion timesteps: {len(timesteps)}", file=sys.stderr, flush=True)
         print(f"First timestep: {timesteps[0]}, Last timestep: {timesteps[-1]}", file=sys.stderr, flush=True)
         
@@ -522,7 +689,6 @@ class GenPhotoPipeline(AnimationPipeline):
                 print(f"  Inversion step {i}/{len(timesteps)}, t={t.item()}", file=sys.stderr, flush=True)
                 print(f"    Latent stats - min: {x.min().item():.4f}, max: {x.max().item():.4f}, mean: {x.mean().item():.4f}", file=sys.stderr, flush=True)
             
-            # Prepare input for CFG
             if do_cfg:
                 latent_model_input = torch.cat([x] * 2)
             else:
@@ -530,7 +696,6 @@ class GenPhotoPipeline(AnimationPipeline):
             
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
             
-            # UNet prediction with camera features
             with torch.no_grad():
                 noise_pred = self.unet(
                     latent_model_input,
@@ -539,40 +704,32 @@ class GenPhotoPipeline(AnimationPipeline):
                     camera_embedding_features=camera_embedding_features
                 ).sample
             
-            # Apply CFG
             if do_cfg:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
             
-            # DDIM inversion step
             current_t_val = t.item()
             alpha_t = self.scheduler.alphas_cumprod[current_t_val]
             
             if i + 1 < len(timesteps):
                 next_t_val = timesteps[i + 1].item()
             else:
-                next_t_val = self.scheduler.timesteps[0].item()  # Should be 999 or max timestep
+                next_t_val = self.scheduler.timesteps[0].item()
             
             alpha_t_next = self.scheduler.alphas_cumprod[next_t_val]
             
-            # Inversion formula: go from less noisy to more noisy
             predicted_x0 = (x - (1 - alpha_t).sqrt() * noise_pred) / alpha_t.sqrt()
             predicted_x0 = predicted_x0.detach()
             
-            # Direction to next (noisier) latent
-            direction = (1 - alpha_t_next).sqrt() * noise_pred
-            x = alpha_t_next.sqrt() * predicted_x0 + direction
-            
-            del predicted_x0, noise_pred, direction
+            x = alpha_t_next.sqrt() * predicted_x0 + (1 - alpha_t_next).sqrt() * noise_pred
+            del predicted_x0, noise_pred
             if i % 10 == 0:
                 torch.cuda.empty_cache()
         
         print(f"✓ Inversion complete: {x.shape}", file=sys.stderr, flush=True)
         print(f"Final inverted latent stats - min: {x.min().item():.4f}, max: {x.max().item():.4f}, mean: {x.mean().item():.4f}", file=sys.stderr, flush=True)
         print(f"{'='*60}\n", file=sys.stderr, flush=True)
-        x = x * self.scheduler.init_noise_sigma
         return x
-    # ==================== END NEW METHOD ====================
 
     def decode_latents(self, latents):
         video_length = latents.shape[2]
@@ -588,7 +745,6 @@ class GenPhotoPipeline(AnimationPipeline):
         return video
 
     def _encode_prompt(self, prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt):
-        # ... keep original implementation unchanged ...
         batch_size = len(prompt) if isinstance(prompt, list) else 1
 
         text_inputs = self.tokenizer(
@@ -693,11 +849,12 @@ class GenPhotoPipeline(AnimationPipeline):
         callback_steps: Optional[int] = 1,
         multidiff_total_steps: int = 1,
         multidiff_overlaps: int = 12,
-        # ==================== ADD THESE PARAMETERS ====================
         input_image_path: Optional[str] = None,
         use_inversion: bool = False,
-        num_inversion_steps: int = 50,
-        # ==================== END NEW PARAMETERS ====================
+        use_null_text_inversion: bool = False,
+        num_inversion_steps: int = 100,
+        null_text_inner_steps: int = 10,
+        null_text_learning_rate: float = 1e-3,
         **kwargs,
     ):
         import sys
@@ -705,6 +862,7 @@ class GenPhotoPipeline(AnimationPipeline):
         print(f"\n{'='*60}", file=sys.stderr, flush=True)
         print(f"GenPhotoPipeline __call__", file=sys.stderr, flush=True)
         print(f"use_inversion: {use_inversion}", file=sys.stderr, flush=True)
+        print(f"use_null_text_inversion: {use_null_text_inversion}", file=sys.stderr, flush=True)
         print(f"input_image_path: {input_image_path}", file=sys.stderr, flush=True)
         print(f"{'='*60}\n", file=sys.stderr, flush=True)
         
@@ -734,7 +892,6 @@ class GenPhotoPipeline(AnimationPipeline):
             "", device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt
         )
 
-
         # Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
@@ -745,7 +902,7 @@ class GenPhotoPipeline(AnimationPipeline):
         video_length = multidiff_total_steps * (video_length - multidiff_overlaps) + multidiff_overlaps
         num_channels_latents = self.unet.in_channels
 
-        # ==================== ENCODE CAMERA FEATURES FIRST ====================
+        # Encode camera embeddings
         print("Encoding camera embeddings...", file=sys.stderr, flush=True)
         if isinstance(camera_embedding, list):
             assert all([x.ndim == 5 for x in camera_embedding])
@@ -762,7 +919,6 @@ class GenPhotoPipeline(AnimationPipeline):
             camera_embedding_features = [rearrange(x, '(b f) c h w -> b c f h w', b=bs)
                                        for x in camera_embedding_features]
 
-        # Duplicate for CFG
         if isinstance(camera_embedding_features[0], list):
             camera_embedding_features_cfg = [[torch.cat([x, x], dim=0) for x in camera_embedding_feature]
                                        for camera_embedding_feature in camera_embedding_features] \
@@ -772,26 +928,24 @@ class GenPhotoPipeline(AnimationPipeline):
                 if do_classifier_free_guidance else camera_embedding_features
         
         print("Camera features ready", file=sys.stderr, flush=True)
-        # ==================== END CAMERA ENCODING ====================
 
-        # ==================== ENCODE INVERSION CAMERA FEATURES FIRST ====================
+        # Encode inversion camera embeddings
         print("Encoding inversion camera embeddings...", file=sys.stderr, flush=True)
         if isinstance(inversion_camera_embedding, list):
             assert all([x.ndim == 5 for x in inversion_camera_embedding])
             inversion_bs = inversion_camera_embedding[0].shape[0]
             inversion_camera_embedding_features = []
             for pe in inversion_camera_embedding:
-                inversion_camera_embedding_features = self.camera_encoder(pe)
-                inversion_camera_embedding_features = [rearrange(x, '(b f) c h w -> b c f h w', b=bs) for x in inversion_camera_embedding_features]
-                inversion_camera_embedding_features.append(inversion_camera_embedding_features)
+                inversion_camera_embedding_feature = self.camera_encoder(pe)
+                inversion_camera_embedding_feature = [rearrange(x, '(b f) c h w -> b c f h w', b=inversion_bs) for x in inversion_camera_embedding_feature]
+                inversion_camera_embedding_features.append(inversion_camera_embedding_feature)
         else:
-            bs = camera_embedding.shape[0]
-            assert camera_embedding.ndim == 5
-            camera_embedding_features = self.camera_encoder(camera_embedding)
-            inversion_camera_embedding_features = [rearrange(x, '(b f) c h w -> b c f h w', b=bs)
-                                       for x in camera_embedding_features]
+            inversion_bs = inversion_camera_embedding.shape[0]
+            assert inversion_camera_embedding.ndim == 5
+            inversion_camera_embedding_features = self.camera_encoder(inversion_camera_embedding)
+            inversion_camera_embedding_features = [rearrange(x, '(b f) c h w -> b c f h w', b=inversion_bs)
+                                       for x in inversion_camera_embedding_features]
 
-        # Duplicate for CFG
         if isinstance(inversion_camera_embedding_features[0], list):
             inversion_camera_embedding_features_cfg = [[torch.cat([x, x], dim=0) for x in inversion_camera_embedding_feature]
                                        for inversion_camera_embedding_feature in inversion_camera_embedding_features] \
@@ -801,71 +955,92 @@ class GenPhotoPipeline(AnimationPipeline):
                 if do_classifier_free_guidance else inversion_camera_embedding_features
         
         print("Inversion Camera features ready", file=sys.stderr, flush=True)
-        # ==================== END CAMERA ENCODING ====================
 
+        # Store optimized uncond embeddings for generation
+        optimized_uncond_embeddings_list = None
 
+        # Prepare latents with optional null text inversion
+        print(f"Preparing latents (null_text={use_null_text_inversion}, inversion={use_inversion})...", file=sys.stderr, flush=True)
 
+        if use_null_text_inversion and input_image_path:
+            print(f"Using NULL TEXT INVERSION: Optimizing unconditional embeddings", file=sys.stderr, flush=True)
 
-        # ==================== PREPARE LATENTS (WITH OPTIONAL INVERSION) ====================
-        print(f"Preparing latents (inversion={use_inversion})...", file=sys.stderr, flush=True)
-
-        if use_inversion and input_image_path:
-            print(f"preparing hybrid initialization: Frame 0 (Inverted) + Frames 1-4 (Random Noise)", file=sys.stderr, flush=True)
-
-            # 1. Run Inversion (Result: [1, 4, 5, 32, 48])
-            inverted_latents = self.invert_latents_from_image(
+            # Extract first frame camera features for inversion
+            if isinstance(inversion_camera_embedding_features_cfg[0], list):
+                inversion_camera_features_single = [[x[:, :, :1] for x in feature_list] 
+                                                   for feature_list in inversion_camera_embedding_features_cfg]
+            else:
+                inversion_camera_features_single = [x[:, :, :1] for x in inversion_camera_embedding_features_cfg]
+            
+            # Perform null text inversion
+            inverted_frame0, optimized_uncond_embeddings_list = self.null_text_inversion(
                 input_image_path,
-                video_length, # Assuming this generates the full 5 frames as stated
+                1,  # Single frame
                 height,
                 width,
-                inversion_text_embeddings,
-                inversion_camera_embedding_features_cfg,
+                prompt[0] if isinstance(prompt, list) else prompt,
+                inversion_camera_features_single,
                 device,
                 guidance_scale,
-                num_inversion_steps
+                num_inversion_steps,
+                null_text_inner_steps,
+                null_text_learning_rate
             )
-            print(f"Inverted latents shape: {inverted_latents.shape}", file=sys.stderr, flush=True)
+            
+            print(f"Inverted frame 0 shape: {inverted_frame0.shape}", file=sys.stderr, flush=True)
 
-            # 2. Run Prepare Latents (Result: [1, 4, 5, 32, 48])
-            # We generate fresh random noise for the whole sequence
-            random_latents = self.prepare_latents(
+            # Generate random noise for remaining frames
+            random_frames = self.prepare_latents(
                 batch_size * num_videos_per_prompt,
                 num_channels_latents,
-                video_length,
+                video_length - 1,
                 height,
                 width,
                 text_embeddings.dtype,
                 device,
                 generator,
-                latents,
+                None,
             )
-            print(f"Random latents shape: {random_latents.shape}", file=sys.stderr, flush=True)
-
-            inv_mean = inverted_latents.mean().item()
-            inv_std = inverted_latents.std().item()
-            inv_min = inverted_latents.min().item()
-            inv_max = inverted_latents.max().item()
             
-            rnd_mean = random_latents.mean().item()
-            rnd_std = random_latents.std().item()
-            rnd_min = random_latents.min().item()
-            rnd_max = random_latents.max().item()
+            latents = torch.cat([inverted_frame0, random_frames], dim=2)
+            print(f"✓ Hybrid latents with null text inversion: {latents.shape}", file=sys.stderr, flush=True)
 
-            inverted_latents_fixed = inverted_latents * (rnd_std / inv_std)
+        elif use_inversion and input_image_path:
+            print(f"Using standard DDIM inversion", file=sys.stderr, flush=True)
 
-
-            # Rescale the inverted latents to match the random noise
-            # If inv is 0.68 and rnd is 1.0, this boosts inv by ~1.47x
-
-            print(f"\n[Distribution Check]", file=sys.stderr)
-            print(f"Inverted | Mean: {inv_mean:.4f} | Std: {inv_std:.4f} | Range: [{inv_min:.4f}, {inv_max:.4f}]", file=sys.stderr)
-            print(f"Random   | Mean: {rnd_mean:.4f} | Std: {rnd_std:.4f} | Range: [{rnd_min:.4f}, {rnd_max:.4f}]", file=sys.stderr)
-            # latents = torch.cat([frame_from_inversion, frames_from_noise], dim=2)
-            latents =  inverted_latents_fixed * 0.3 + random_latents * 0.7
+            if isinstance(inversion_camera_embedding_features_cfg[0], list):
+                inversion_camera_features_single = [[x[:, :, :1] for x in feature_list] 
+                                                   for feature_list in inversion_camera_embedding_features_cfg]
+            else:
+                inversion_camera_features_single = [x[:, :, :1] for x in inversion_camera_embedding_features_cfg]
             
-            print(f"Merged hybrid latents.", file=sys.stderr, flush=True)
+            inverted_frame0 = self.invert_latents_from_image(
+                input_image_path,
+                5,
+                height,
+                width,
+                inversion_text_embeddings,
+                inversion_camera_features_single,
+                device,
+                guidance_scale,
+                num_inversion_steps
+            )
+            
+            random_frames = self.prepare_latents(
+                batch_size * num_videos_per_prompt,
+                num_channels_latents,
+                video_length - 5,
+                height,
+                width,
+                text_embeddings.dtype,
+                device,
+                generator,
+                None,
+            )
+            
+            latents = torch.cat([inverted_frame0, random_frames], dim=2)
+            print(f"✓ Hybrid latents with DDIM inversion: {latents.shape}", file=sys.stderr, flush=True)
         else:
-            # Use random noise (original behavior)
             latents = self.prepare_latents(
                 batch_size * num_videos_per_prompt,
                 num_channels_latents,
